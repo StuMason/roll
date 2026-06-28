@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/StuMason/roll/schemas/pack.schema.json",
+  "title": "Roll take",
+  "description": "A recorded take: per-source media + input telemetry + an index, all on one shared clock. This is the contract between the recorder and everything downstream (cruncher, editing agent).",
+  "type": "object",
+  "$defs": {
+    "sourceKind": { "enum": ["screen", "camera", "mic"] },
+    "packSource": {
+      "type": "object",
+      "required": ["kind", "file", "fps", "offsetMs"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/sourceKind" },
+        "file": { "type": "string", "description": "filename within the take directory" },
+        "fps": { "type": "integer", "minimum": 1 },
+        "width": { "type": "integer" },
+        "height": { "type": "integer" },
+        "offsetMs": {
+          "type": "integer",
+          "description": "this source's start relative to the shared clock origin; 0 = aligned"
+        }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "required": ["version", "id", "createdEpochMs", "fps", "clock", "sources", "metadataFile"],
+      "properties": {
+        "version": { "type": "string" },
+        "id": { "type": "string" },
+        "createdEpochMs": { "type": "integer" },
+        "fps": { "type": "integer" },
+        "clock": { "type": "string" },
+        "sources": { "type": "array", "items": { "$ref": "#/$defs/packSource" } },
+        "metadataFile": { "const": "metadata.jsonl" }
+      }
+    },
+    "event": {
+      "description": "One row of metadata.jsonl. t_ms is measured from the shared clock origin.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "t_ms", "x", "y", "button"],
+          "properties": {
+            "type": { "const": "click" },
+            "t_ms": { "type": "integer" },
+            "x": { "type": "integer" },
+            "y": { "type": "integer" },
+            "button": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "t_ms", "key"],
+          "properties": {
+            "type": { "const": "key" },
+            "t_ms": { "type": "integer" },
+            "key": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "t_ms", "app", "title", "action"],
+          "properties": {
+            "type": { "const": "window" },
+            "t_ms": { "type": "integer" },
+            "app": { "type": "string" },
+            "title": { "type": "string" },
+            "action": { "type": "string" }
+          }
+        }
+      ]
+    }
+  },
+  "properties": {
+    "manifest": { "$ref": "#/$defs/manifest" }
+  }
+}

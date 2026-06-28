@@ -1,0 +1,147 @@
+:root {
+  --bg: #0e0f12;
+  --panel: #17191f;
+  --line: #262a33;
+  --text: #e7e9ee;
+  --muted: #8b909c;
+  --rec: #e5484d;
+  --accent: #4cc38a;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  user-select: none;
+}
+
+.wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 18px;
+  min-height: 100vh;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+h1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 18px;
+  margin: 0;
+  letter-spacing: 0.5px;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.dot.live {
+  background: var(--rec);
+  box-shadow: 0 0 0 0 rgba(229, 72, 77, 0.7);
+  animation: pulse 1.4s infinite;
+}
+@keyframes pulse {
+  to {
+    box-shadow: 0 0 0 8px rgba(229, 72, 77, 0);
+  }
+}
+
+.backend {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sources {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sources label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.sources label.on {
+  border-color: var(--accent);
+}
+
+.timer {
+  font-variant-numeric: tabular-nums;
+  font-size: 44px;
+  text-align: center;
+  color: var(--muted);
+  font-weight: 600;
+}
+.timer.live {
+  color: var(--text);
+}
+
+.btn {
+  border: none;
+  border-radius: 12px;
+  padding: 14px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #fff;
+  cursor: pointer;
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn.rec {
+  background: var(--rec);
+}
+.btn.stop {
+  background: #2b2f3a;
+}
+
+.result {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 13px;
+}
+.result h2 {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.result .dir {
+  display: block;
+  color: var(--accent);
+  font-size: 11px;
+  word-break: break-all;
+  margin-bottom: 8px;
+}
+.result ul {
+  margin: 0;
+  padding-left: 16px;
+  color: var(--muted);
+}
+.result b {
+  color: var(--text);
+}
