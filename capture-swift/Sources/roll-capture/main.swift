@@ -5,12 +5,13 @@ import CoreMedia
 
 // roll-capture — native macOS capture helper for the roll pack.
 //
-// Step 1: ScreenCaptureKit -> screen.mp4 at real 30fps with hardware H.264
-// (AVAssetWriter). This is the piece that fixes the ffmpeg 4fps problem.
-// Camera, mic, input telemetry and the Accessibility layer land next, all on
-// one shared clock, matching the pack contract the Python rig validated.
+// Step 1 (frames): ScreenCaptureKit -> screen.mp4 with hardware H.264.
+// SCK captures at the display's native size on the GPU; we optionally downscale
+// before the encoder (--width/--height) because a 1440p H.264 encode is too much
+// for an Intel Mac's VideoToolbox at 30fps (1080p is the safe zone). A frame
+// counter reports delivered-vs-written so encoder drops are visible.
 
-let VERSION = "0.0.2"
+let VERSION = "0.0.3"
 
 func argVal(_ name: String) -> String? {
     let a = CommandLine.arguments
@@ -21,7 +22,6 @@ func err(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .u
 
 let args = CommandLine.arguments
 
-// Capability report — used by CI (no capture, no permissions needed).
 func capabilityReport() {
     print("roll-capture \(VERSION)")
     if #available(macOS 13.0, *) { print("ScreenCaptureKit: available") }
@@ -36,23 +36,31 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     private var input: AVAssetWriterInput!
     private var stream: SCStream!
     private var started = false
+    private var delivered = 0
+    private var written = 0
 
-    func start(display: SCDisplay, fps: Int, outURL: URL) async throws {
+    func start(display: SCDisplay, fps: Int, width: Int, height: Int, outURL: URL) async throws {
         writer = try AVAssetWriter(url: outURL, fileType: .mp4)
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: display.width,
-            AVVideoHeightKey: display.height,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 10_000_000,
+                AVVideoMaxKeyFrameIntervalKey: fps * 2,
+                AVVideoExpectedSourceFrameRateKey: fps,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+            ],
         ]
         input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = true
         writer.add(input)
 
         let config = SCStreamConfiguration()
-        config.width = display.width
-        config.height = display.height
+        config.width = width                       // GPU-side scale before the encoder
+        config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.queueDepth = 6
+        config.queueDepth = 8
         config.showsCursor = true
         config.pixelFormat = kCVPixelFormatType_32BGRA
 
@@ -67,6 +75,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         try? await stream.stopCapture()
         input.markAsFinished()
         await writer.finishWriting()
+        err("frames: delivered=\(delivered) written=\(written) dropped=\(delivered - written)")
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -79,6 +88,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
               let status = SCFrameStatus(rawValue: statusRaw),
               status == .complete else { return }
 
+        delivered += 1
         if !started {
             writer.startWriting()
             writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
@@ -86,6 +96,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         }
         if input.isReadyForMoreMediaData {
             input.append(sampleBuffer)
+            written += 1
         }
     }
 }
@@ -103,17 +114,19 @@ func listDisplays() async {
 }
 
 @available(macOS 13.0, *)
-func record(index: Int, outDir: String, fps: Int, secs: Double) async {
+func record(index: Int, outDir: String, fps: Int, secs: Double, wOverride: Int?, hOverride: Int?) async {
     do {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false, onScreenWindowsOnly: true)
         guard index < content.displays.count else { err("no display \(index)"); exit(1) }
         let display = content.displays[index]
+        let width = wOverride ?? display.width
+        let height = hOverride ?? display.height
         try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
         let outURL = URL(fileURLWithPath: outDir).appendingPathComponent("screen.mp4")
         let rec = ScreenRecorder()
-        try await rec.start(display: display, fps: fps, outURL: outURL)
-        err("recording \(display.width)x\(display.height)@\(fps) -> \(outURL.path)  (Ctrl-C to stop)")
+        try await rec.start(display: display, fps: fps, width: width, height: height, outURL: outURL)
+        err("recording \(width)x\(height)@\(fps) (display \(display.width)x\(display.height)) -> \(outURL.path)")
         if secs > 0 {
             try await Task.sleep(nanoseconds: UInt64(secs * 1_000_000_000))
             await rec.stop()
@@ -122,11 +135,9 @@ func record(index: Int, outDir: String, fps: Int, secs: Double) async {
         } else {
             let src = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
             signal(SIGINT, SIG_IGN)
-            src.setEventHandler {
-                Task { await rec.stop(); print("done"); exit(0) }
-            }
+            src.setEventHandler { Task { await rec.stop(); print("done"); exit(0) } }
             src.resume()
-            try await Task.sleep(nanoseconds: UInt64.max)  // park until SIGINT
+            try await Task.sleep(nanoseconds: UInt64.max)
         }
     } catch { err("capture failed: \(error)"); exit(1) }
 }
@@ -136,22 +147,24 @@ if args.contains("--help") || args.contains("-h") {
     print("""
     roll-capture \(VERSION)
       --list
-      --screen <index> --out <dir> [--fps 30] [--secs N]
+      --screen <index> --out <dir> [--fps 30] [--secs N] [--width W --height H]
     """)
     exit(0)
 }
 
 if #available(macOS 13.0, *) {
-    let sem = DispatchSemaphore(value: 0)
     if args.contains("--list") {
+        let sem = DispatchSemaphore(value: 0)
         Task { await listDisplays(); sem.signal() }
         sem.wait(); exit(0)
     }
     if let scr = argVal("--screen"), let outDir = argVal("--out") {
         let fps = Int(argVal("--fps") ?? "30") ?? 30
         let secs = Double(argVal("--secs") ?? "0") ?? 0
-        Task { await record(index: Int(scr) ?? 0, outDir: outDir, fps: fps, secs: secs) }
-        RunLoop.main.run()  // keep alive for the capture queue + signal source
+        let w = argVal("--width").flatMap { Int($0) }
+        let h = argVal("--height").flatMap { Int($0) }
+        Task { await record(index: Int(scr) ?? 0, outDir: outDir, fps: fps, secs: secs, wOverride: w, hOverride: h) }
+        RunLoop.main.run()
     }
 }
 
