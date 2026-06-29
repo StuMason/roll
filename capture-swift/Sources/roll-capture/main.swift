@@ -10,7 +10,7 @@ import CoreMedia
 //   on the same host clock. A manifest records each roll's first-frame host time
 //   so the cruncher can align them. Mic + telemetry + AX land next.
 
-let VERSION = "0.0.4"
+let VERSION = "0.0.5"
 
 func argVal(_ name: String) -> String? {
     let a = CommandLine.arguments
@@ -32,6 +32,12 @@ func cameraDevices() -> [AVCaptureDevice] {
     AVCaptureDevice.DiscoverySession(
         deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
         mediaType: .video, position: .unspecified).devices
+}
+
+func micDevices() -> [AVCaptureDevice] {
+    AVCaptureDevice.DiscoverySession(
+        deviceTypes: [.microphone, .external],
+        mediaType: .audio, position: .unspecified).devices
 }
 
 // ---- screen (ScreenCaptureKit) ----
@@ -134,6 +140,50 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     }
 }
 
+// ---- microphone (AVFoundation) ----
+final class MicRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let session = AVCaptureSession()
+    private var writer: AVAssetWriter!
+    private var input: AVAssetWriterInput!
+    private var started = false
+    private(set) var written = 0
+    private(set) var firstPTS: Double = 0
+
+    func start(device: AVCaptureDevice, outURL: URL) throws {
+        session.beginConfiguration()
+        let micIn = try AVCaptureDeviceInput(device: device)
+        if session.canAddInput(micIn) { session.addInput(micIn) }
+        let out = AVCaptureAudioDataOutput()
+        out.setSampleBufferDelegate(self, queue: DispatchQueue(label: "roll.mic"))
+        if session.canAddOutput(out) { session.addOutput(out) }
+        session.commitConfiguration()
+
+        writer = try AVAssetWriter(url: outURL, fileType: .m4a)
+        input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVNumberOfChannelsKey: 1,
+            AVSampleRateKey: 48000,
+            AVEncoderBitRateKey: 128_000,
+        ])
+        input.expectsMediaDataInRealTime = true
+        writer.add(input)
+        session.startRunning()
+    }
+
+    func stop() async {
+        session.stopRunning()
+        input.markAsFinished()
+        await writer.finishWriting()
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if !started { writer.startWriting(); writer.startSession(atSourceTime: pts); firstPTS = pts.seconds; started = true }
+        if input.isReadyForMoreMediaData { input.append(sampleBuffer); written += 1 }
+    }
+}
+
 @available(macOS 13.0, *)
 func listAll() async {
     do {
@@ -143,10 +193,12 @@ func listAll() async {
     } catch { err("display list failed: \(error)") }
     print("cameras:")
     for (i, d) in cameraDevices().enumerated() { print("  [\(i)] \(d.localizedName)") }
+    print("mics:")
+    for (i, d) in micDevices().enumerated() { print("  [\(i)] \(d.localizedName)") }
 }
 
 @available(macOS 13.0, *)
-func record(screenIdx: Int, camIdx: Int?, outDir: String, fps: Int, secs: Double, w: Int?, h: Int?) async {
+func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int, secs: Double, w: Int?, h: Int?) async {
     do {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard screenIdx < content.displays.count else { err("no display \(screenIdx)"); exit(1) }
@@ -167,20 +219,38 @@ func record(screenIdx: Int, camIdx: Int?, outDir: String, fps: Int, secs: Double
             cam = c
             err("camera: \(devs[ci].localizedName)")
         }
-        err("recording screen \(w ?? display.width)x\(h ?? display.height)@\(fps)\(camIdx != nil ? " + camera" : "")")
+
+        var mic: MicRecorder?
+        if let mi = micIdx {
+            let devs = micDevices()
+            guard mi < devs.count else { err("no mic \(mi)"); exit(1) }
+            let m = MicRecorder()
+            try m.start(device: devs[mi], outURL: dir.appendingPathComponent("mic.m4a"))
+            mic = m
+            err("mic: \(devs[mi].localizedName)")
+        }
+        err("recording screen \(w ?? display.width)x\(h ?? display.height)@\(fps)\(camIdx != nil ? " + camera" : "")\(micIdx != nil ? " + mic" : "")")
 
         func finish() async {
             await screen.stop()
             if let c = cam { await c.stop() }
+            if let m = mic { await m.stop() }
             err("screen frames: delivered=\(screen.delivered) written=\(screen.written) dropped=\(screen.delivered - screen.written)")
             if let c = cam { err("camera frames: written=\(c.written)") }
-            // manifest: roll start offsets on the shared host clock
-            let manifest: [String: Any] = [
+            if let m = mic { err("mic buffers: written=\(m.written)") }
+            // manifest: roll start offsets on the shared host clock (all firstPTS in host seconds)
+            var manifest: [String: Any] = [
                 "version": VERSION, "fps": fps,
                 "screen": ["file": "screen.mp4", "firstPTS": screen.firstPTS],
-                "camera": cam.map { ["file": "camera.mp4", "firstPTS": $0.firstPTS] } as Any,
-                "syncOffsetMs": cam.map { ($0.firstPTS - screen.firstPTS) * 1000 } as Any,
             ]
+            if let c = cam {
+                manifest["camera"] = ["file": "camera.mp4", "firstPTS": c.firstPTS]
+                manifest["cameraSyncOffsetMs"] = (c.firstPTS - screen.firstPTS) * 1000
+            }
+            if let m = mic {
+                manifest["mic"] = ["file": "mic.m4a", "firstPTS": m.firstPTS]
+                manifest["micSyncOffsetMs"] = (m.firstPTS - screen.firstPTS) * 1000
+            }
             if let data = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted]) {
                 try? data.write(to: dir.appendingPathComponent("manifest.json"))
             }
@@ -206,7 +276,7 @@ if args.contains("--help") || args.contains("-h") {
     print("""
     roll-capture \(VERSION)
       --list
-      --screen <i> [--cam <i>] --out <dir> [--fps 30] [--secs N] [--width W --height H]
+      --screen <i> [--cam <i>] [--mic <i>] --out <dir> [--fps 30] [--secs N] [--width W --height H]
     """)
     exit(0)
 }
@@ -223,6 +293,7 @@ if #available(macOS 13.0, *) {
         Task {
             await record(screenIdx: Int(scr) ?? 0,
                          camIdx: argVal("--cam").flatMap { Int($0) },
+                         micIdx: argVal("--mic").flatMap { Int($0) },
                          outDir: outDir, fps: fps, secs: secs,
                          w: argVal("--width").flatMap { Int($0) },
                          h: argVal("--height").flatMap { Int($0) })
