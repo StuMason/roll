@@ -18,7 +18,7 @@ import ApplicationServices
 // Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
 // truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.13"
+let VERSION = "0.0.14"
 
 // keyCodes that have no sensible printable character — named so the key stream
 // is legible (charactersIgnoringModifiers returns control/unicode junk for these)
@@ -30,16 +30,15 @@ let NAMED_KEYS: [Int: String] = [
     100: "f8", 101: "f9", 109: "f10", 103: "f11", 111: "f12",
 ]
 
-// macOS injects system "video effects" (Center Stage auto-framing, Portrait
-// blur, Studio Light) into ANY camera feed. They mutate the image mid-take — a
-// faithful capture for editing must not have them. Center Stage we can force
-// off from the app; Portrait/Studio Light are user-only (Control Center), so we
-// just warn if they're active.
-func neutralizeCameraEffects(_ device: AVCaptureDevice) {
-    if device.activeFormat.isCenterStageSupported {
-        AVCaptureDevice.centerStageControlMode = .app
-        AVCaptureDevice.isCenterStageEnabled = false
-    }
+// The iPhone's main Continuity Camera is ultra-wide; Center Stage is what crops
+// it down to a framed face shot (per WWDC22 "Bring Continuity Camera to your
+// macOS app"). Force it OFF and you get the raw ultra-wide field — which looks
+// like a wide "desk view". So we DON'T override it: we leave Center Stage to the
+// user's Control Center toggle (control mode `.user`, default on = framed face).
+// We only surface the effects we can read but can't change.
+func noteCameraEffects(_ device: AVCaptureDevice) {
+    // respect Control Center rather than forcing the framing either way
+    AVCaptureDevice.centerStageControlMode = .user
     if device.isPortraitEffectActive { err("warning: Portrait effect is ON for \(device.localizedName) — turn it off in Control Center (app can't)") }
     if #available(macOS 14.0, *), device.isStudioLightActive {
         err("warning: Studio Light is ON for \(device.localizedName) — turn it off in Control Center (app can't)")
@@ -195,7 +194,7 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private(set) var firstWrittenPTS: Double = 0
 
     func arm(device: AVCaptureDevice, outURL: URL) throws {
-        neutralizeCameraEffects(device)   // no mid-take Center Stage zoom
+        noteCameraEffects(device)   // respect the user's Center Stage setting
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
         let camIn = try AVCaptureDeviceInput(device: device)
@@ -507,9 +506,28 @@ func listAll() async {
         }
     } catch { err("display list failed: \(error)") }
     print("cameras:")
-    for (i, d) in cameraDevices().enumerated() { print("  [\(i)] \(d.localizedName)") }
+    for (i, d) in cameraDevices().enumerated() { print("  [\(i)] \(d.localizedName)\(camInfo(d))") }
     print("mics:")
     for (i, d) in micDevices().enumerated() { print("  [\(i)] \(d.localizedName)") }
+}
+
+// Ground-truth a camera using the Continuity Camera / Desk View APIs: its
+// device type, whether it's a Continuity Camera, whether it carries a Desk View
+// companion (companion!=nil ⇒ this IS the main camera), and its format sizes.
+func camInfo(_ d: AVCaptureDevice) -> String {
+    var bits = ["type=\(d.deviceType.rawValue.replacingOccurrences(of: "AVCaptureDeviceType", with: ""))"]
+    if #available(macOS 13.0, *) {
+        bits.append("continuity=\(d.isContinuityCamera)")
+        bits.append("deskCompanion=\(d.companionDeskViewCamera != nil)")
+    }
+    let dims = d.formats.map { f -> String in
+        let dm = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+        return "\(dm.width)x\(dm.height)"
+    }
+    let active = CMVideoFormatDescriptionGetDimensions(d.activeFormat.formatDescription)
+    bits.append("active=\(active.width)x\(active.height)")
+    bits.append("fmts=[\(Array(Set(dims)).sorted().joined(separator: ","))]")
+    return "  (" + bits.joined(separator: " ") + ")"
 }
 
 // One-shot screenshot of a display, downscaled, as a base64 PNG on stdout.
