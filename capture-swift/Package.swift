@@ -6,7 +6,7 @@ import PackageDescription
 // runnable standalone as a CLI for fast on-device testing.
 let package = Package(
     name: "roll-capture",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(name: "roll-capture", path: "Sources/roll-capture")
     ]
