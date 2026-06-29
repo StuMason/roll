@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Dropdown, { Opt } from "./components/Dropdown";
 import CameraPreview from "./components/CameraPreview";
-import { ENGINE, listDevices, onState, reveal, startRecording, stopRecording } from "./api";
+import { ENGINE, highlightDisplay, listDevices, onState, reveal, startRecording, stopRecording } from "./api";
 import type { Devices, LiveStats, Pack, RecState, RecordConfig } from "./types";
 
 const FPS = [24, 30, 60];
@@ -71,6 +71,16 @@ export default function App() {
   const cameraLabel = devices?.cameras.find((c) => c.index === camera)?.label ?? "";
   const displayLabel = devices?.displays.find((d) => d.index === display)?.label ?? "";
 
+  function chooseDisplay(v: number | null) {
+    const idx = v ?? 0;
+    setDisplay(idx);
+    const d = devices?.displays.find((x) => x.index === idx);
+    // flash the chosen screen so you can confirm which monitor (multi-display only)
+    if (d && d.w && d.h && (devices?.displays.length ?? 0) > 1) {
+      highlightDisplay(d.x ?? 0, d.y ?? 0, d.w, d.h);
+    }
+  }
+
   async function start() {
     await startRecording(cfg);
   }
@@ -109,7 +119,7 @@ export default function App() {
 
         <section className="controls">
           <div className="row">
-            <Dropdown label="Display" value={display} options={displayOpts} onChange={(v) => setDisplay(v ?? 0)} disabled={busy} />
+            <Dropdown label="Display" value={display} options={displayOpts} onChange={chooseDisplay} disabled={busy} />
             <button className="ghost" onClick={loadDevices} disabled={busy} title="Re-scan devices">
               ↻ Refresh
             </button>

@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+      .border {
+        position: fixed;
+        inset: 0;
+        box-sizing: border-box;
+        border: 8px solid #5b8cff;
+        border-radius: 6px;
+        box-shadow: inset 0 0 60px rgba(91, 140, 255, 0.45);
+        animation: flash 0.55s ease-in-out 2 alternate;
+      }
+      @keyframes flash {
+        from { opacity: 0.25; }
+        to { opacity: 1; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="border"></div>
+  </body>
+</html>

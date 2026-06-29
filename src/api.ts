@@ -112,6 +112,16 @@ export async function stopRecording(cfg: RecordConfig): Promise<Pack> {
   return core.invoke<Pack>("stop_recording");
 }
 
+export async function highlightDisplay(x: number, y: number, w: number, h: number): Promise<void> {
+  if (!isTauri) {
+    // eslint-disable-next-line no-console
+    console.log("[mock] highlight display", x, y, w, h);
+    return;
+  }
+  const { core } = await tauri();
+  await core.invoke("highlight_display", { x, y, w, h });
+}
+
 export async function reveal(dir: string): Promise<void> {
   if (!isTauri) {
     // eslint-disable-next-line no-console

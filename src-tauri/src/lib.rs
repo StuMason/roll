@@ -13,12 +13,21 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct Device {
     index: u32,
     label: String,
+    // displays carry their screen frame so the app can highlight them
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    y: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    w: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    h: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -120,12 +129,26 @@ fn recordings_root(app: &AppHandle) -> PathBuf {
 }
 
 // ---- device list parsing (`roll-capture --list`) ----
-fn display_label(raw: &str) -> String {
-    // raw like "id=724071956  2560x1440" -> "2560×1440"
-    raw.split_whitespace()
-        .find(|s| s.contains('x'))
-        .map(|res| res.replace('x', "×"))
-        .unwrap_or_else(|| raw.to_string())
+/// Parse a display line's "id=.. x=0 y=0 w=2560 h=1440" tail into a Device.
+fn parse_display(index: u32, tail: &str) -> Device {
+    let mut dev = Device { index, ..Default::default() };
+    for kv in tail.split_whitespace() {
+        if let Some((k, v)) = kv.split_once('=') {
+            let n = v.parse::<i64>().ok();
+            match k {
+                "x" => dev.x = n,
+                "y" => dev.y = n,
+                "w" => dev.w = n,
+                "h" => dev.h = n,
+                _ => {}
+            }
+        }
+    }
+    dev.label = match (dev.w, dev.h) {
+        (Some(w), Some(h)) => format!("{w}×{h}"),
+        _ => "Display".to_string(),
+    };
+    dev
 }
 
 fn parse_devices(text: &str) -> Devices {
@@ -145,9 +168,9 @@ fn parse_devices(text: &str) -> Devices {
                         if let Ok(index) = idx_s.trim().parse::<u32>() {
                             let label = label_s.trim();
                             match section {
-                                "d" => displays.push(Device { index, label: display_label(label) }),
-                                "c" => cameras.push(Device { index, label: label.to_string() }),
-                                "m" => mics.push(Device { index, label: label.to_string() }),
+                                "d" => displays.push(parse_display(index, label)),
+                                "c" => cameras.push(Device { index, label: label.to_string(), ..Default::default() }),
+                                "m" => mics.push(Device { index, label: label.to_string(), ..Default::default() }),
                                 _ => {}
                             }
                         }
@@ -332,6 +355,36 @@ fn reveal(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Flash a transparent borderless overlay on the chosen physical display for a
+/// moment, so you can confirm which screen is being captured (multi-monitor).
+#[tauri::command]
+fn highlight_display(app: AppHandle, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("highlight") {
+        let _ = win.close();
+    }
+    let win = WebviewWindowBuilder::new(&app, "highlight", WebviewUrl::App("overlay.html".into()))
+        .position(x as f64, y as f64)
+        .inner_size(w as f64, h as f64)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .focused(false)
+        .skip_taskbar(true)
+        .resizable(false)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let _ = win.set_ignore_cursor_events(true);
+
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        if let Some(w) = app2.get_webview_window("highlight") {
+            let _ = w.close();
+        }
+    });
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -340,7 +393,8 @@ pub fn run() {
             list_devices,
             start_recording,
             stop_recording,
-            reveal
+            reveal,
+            highlight_display
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -352,10 +406,11 @@ mod tests {
 
     #[test]
     fn parses_device_list() {
-        let t = "displays:\n  [0] id=724071956  2560x1440\ncameras:\n  [0] FaceTime HD Camera\n  [1] iPhone\nmics:\n  [6] RØDE\n";
+        let t = "displays:\n  [0] id=724071956 x=0 y=0 w=2560 h=1440\ncameras:\n  [0] FaceTime HD Camera\n  [1] iPhone\nmics:\n  [6] RØDE\n";
         let d = parse_devices(t);
         assert_eq!(d.displays.len(), 1);
         assert_eq!(d.displays[0].label, "2560×1440");
+        assert_eq!(d.displays[0].w, Some(2560));
         assert_eq!(d.cameras.len(), 2);
         assert_eq!(d.cameras[1].label, "iPhone");
         assert_eq!(d.mics[0].index, 6);

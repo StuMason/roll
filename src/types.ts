@@ -4,6 +4,11 @@
 export interface Device {
   index: number;
   label: string;
+  // displays carry their screen frame (for the highlight overlay)
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
 }
 
 export interface Devices {
