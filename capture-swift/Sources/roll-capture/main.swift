@@ -2,15 +2,20 @@ import Foundation
 import AVFoundation
 import ScreenCaptureKit
 import CoreMedia
+import QuartzCore
 
 // roll-capture — native macOS capture helper for the roll pack.
 //
-// Step 1 (screen): ScreenCaptureKit -> screen.mp4, HW H.264, native res, 0 drops.
-// Step 2 (camera): AVFoundation AVCaptureSession -> camera.mp4, concurrently,
-//   on the same host clock. A manifest records each roll's first-frame host time
-//   so the cruncher can align them. Mic + telemetry + AX land next.
+// Lifecycle is two-phase so multi-source heads line up and slow devices
+// (Continuity Camera does a ~3s "ding" handshake) connect BEFORE recording:
+//   1. arm()        — start every capture session; frames flow but aren't written
+//   2. (warm wait)  — block until all sources have delivered a first frame
+//   3. beginWriting(at t0) — flip all writers on at ONE shared host-clock t0
+// Result: screen.mp4 + camera.mp4 + mic.m4a all start at the same instant,
+// no startup lag eaten from the head, no ding mid-take. manifest.json records
+// each roll's first written PTS so the cruncher can verify alignment.
 
-let VERSION = "0.0.5"
+let VERSION = "0.0.6"
 
 func argVal(_ name: String) -> String? {
     let a = CommandLine.arguments
@@ -40,18 +45,21 @@ func micDevices() -> [AVCaptureDevice] {
         mediaType: .audio, position: .unspecified).devices
 }
 
+func cmt(_ seconds: Double) -> CMTime { CMTime(seconds: seconds, preferredTimescale: 1_000_000) }
+
 // ---- screen (ScreenCaptureKit) ----
 @available(macOS 13.0, *)
 final class ScreenRecorder: NSObject, SCStreamOutput {
     private var writer: AVAssetWriter!
     private var input: AVAssetWriterInput!
     private var stream: SCStream!
-    private var started = false
+    private var writeFrom: Double = .infinity
+    private(set) var ready = false
     private(set) var delivered = 0
     private(set) var written = 0
-    private(set) var firstPTS: Double = 0
+    private(set) var firstWrittenPTS: Double = 0
 
-    func start(display: SCDisplay, fps: Int, width: Int, height: Int, outURL: URL) async throws {
+    func arm(display: SCDisplay, fps: Int, width: Int, height: Int, outURL: URL) async throws {
         writer = try AVAssetWriter(url: outURL, fileType: .mp4)
         input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -65,6 +73,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         ])
         input.expectsMediaDataInRealTime = true
         writer.add(input)
+        writer.startWriting()
 
         let config = SCStreamConfiguration()
         config.width = width; config.height = height
@@ -78,6 +87,11 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         try await stream.startCapture()
     }
 
+    func beginWriting(at t0: Double) {
+        writer.startSession(atSourceTime: cmt(t0))
+        writeFrom = t0
+    }
+
     func stop() async {
         try? await stream.stopCapture()
         input.markAsFinished()
@@ -89,10 +103,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
               let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let statusRaw = arr.first?[.status] as? Int, statusRaw == SCFrameStatus.complete.rawValue
         else { return }
-        delivered += 1
+        ready = true
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        if !started { writer.startWriting(); writer.startSession(atSourceTime: pts); firstPTS = pts.seconds; started = true }
-        if input.isReadyForMoreMediaData { input.append(sampleBuffer); written += 1 }
+        guard pts.seconds >= writeFrom else { return }   // still arming — drop pre-t0 frames
+        delivered += 1
+        if input.isReadyForMoreMediaData {
+            input.append(sampleBuffer); written += 1
+            if firstWrittenPTS == 0 { firstWrittenPTS = pts.seconds }
+        }
     }
 }
 
@@ -101,11 +119,12 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private let session = AVCaptureSession()
     private var writer: AVAssetWriter!
     private var input: AVAssetWriterInput!
-    private var started = false
+    private var writeFrom: Double = .infinity
+    private(set) var ready = false
     private(set) var written = 0
-    private(set) var firstPTS: Double = 0
+    private(set) var firstWrittenPTS: Double = 0
 
-    func start(device: AVCaptureDevice, outURL: URL) throws {
+    func arm(device: AVCaptureDevice, outURL: URL) throws {
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
         let camIn = try AVCaptureDeviceInput(device: device)
@@ -123,7 +142,13 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         ])
         input.expectsMediaDataInRealTime = true
         writer.add(input)
-        session.startRunning()
+        writer.startWriting()
+        session.startRunning()   // triggers the Continuity Camera handshake NOW
+    }
+
+    func beginWriting(at t0: Double) {
+        writer.startSession(atSourceTime: cmt(t0))
+        writeFrom = t0
     }
 
     func stop() async {
@@ -134,9 +159,13 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        ready = true
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        if !started { writer.startWriting(); writer.startSession(atSourceTime: pts); firstPTS = pts.seconds; started = true }
-        if input.isReadyForMoreMediaData { input.append(sampleBuffer); written += 1 }
+        guard pts.seconds >= writeFrom else { return }
+        if input.isReadyForMoreMediaData {
+            input.append(sampleBuffer); written += 1
+            if firstWrittenPTS == 0 { firstWrittenPTS = pts.seconds }
+        }
     }
 }
 
@@ -145,11 +174,12 @@ final class MicRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate 
     private let session = AVCaptureSession()
     private var writer: AVAssetWriter!
     private var input: AVAssetWriterInput!
-    private var started = false
+    private var writeFrom: Double = .infinity
+    private(set) var ready = false
     private(set) var written = 0
-    private(set) var firstPTS: Double = 0
+    private(set) var firstWrittenPTS: Double = 0
 
-    func start(device: AVCaptureDevice, outURL: URL) throws {
+    func arm(device: AVCaptureDevice, outURL: URL) throws {
         session.beginConfiguration()
         let micIn = try AVCaptureDeviceInput(device: device)
         if session.canAddInput(micIn) { session.addInput(micIn) }
@@ -167,7 +197,13 @@ final class MicRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate 
         ])
         input.expectsMediaDataInRealTime = true
         writer.add(input)
+        writer.startWriting()
         session.startRunning()
+    }
+
+    func beginWriting(at t0: Double) {
+        writer.startSession(atSourceTime: cmt(t0))
+        writeFrom = t0
     }
 
     func stop() async {
@@ -178,9 +214,13 @@ final class MicRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate 
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        ready = true
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        if !started { writer.startWriting(); writer.startSession(atSourceTime: pts); firstPTS = pts.seconds; started = true }
-        if input.isReadyForMoreMediaData { input.append(sampleBuffer); written += 1 }
+        guard pts.seconds >= writeFrom else { return }
+        if input.isReadyForMoreMediaData {
+            input.append(sampleBuffer); written += 1
+            if firstWrittenPTS == 0 { firstWrittenPTS = pts.seconds }
+        }
     }
 }
 
@@ -206,16 +246,17 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
         try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
         let dir = URL(fileURLWithPath: outDir)
 
+        // ---- phase 1: ARM all sources (phone connects here) ----
         let screen = ScreenRecorder()
-        try await screen.start(display: display, fps: fps, width: w ?? display.width, height: h ?? display.height,
-                               outURL: dir.appendingPathComponent("screen.mp4"))
+        try await screen.arm(display: display, fps: fps, width: w ?? display.width, height: h ?? display.height,
+                             outURL: dir.appendingPathComponent("screen.mp4"))
 
         var cam: CameraRecorder?
         if let ci = camIdx {
             let devs = cameraDevices()
             guard ci < devs.count else { err("no camera \(ci)"); exit(1) }
             let c = CameraRecorder()
-            try c.start(device: devs[ci], outURL: dir.appendingPathComponent("camera.mp4"))
+            try c.arm(device: devs[ci], outURL: dir.appendingPathComponent("camera.mp4"))
             cam = c
             err("camera: \(devs[ci].localizedName)")
         }
@@ -225,11 +266,32 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             let devs = micDevices()
             guard mi < devs.count else { err("no mic \(mi)"); exit(1) }
             let m = MicRecorder()
-            try m.start(device: devs[mi], outURL: dir.appendingPathComponent("mic.m4a"))
+            try m.arm(device: devs[mi], outURL: dir.appendingPathComponent("mic.m4a"))
             mic = m
             err("mic: \(devs[mi].localizedName)")
         }
-        err("recording screen \(w ?? display.width)x\(h ?? display.height)@\(fps)\(camIdx != nil ? " + camera" : "")\(micIdx != nil ? " + mic" : "")")
+
+        // ---- phase 2: WARM wait — block until every source delivers a frame ----
+        err("warming up (waiting for sources to connect)…")
+        let warmStart = CACurrentMediaTime()
+        let warmDeadline = warmStart + 15
+        while CACurrentMediaTime() < warmDeadline {
+            if screen.ready && (cam?.ready ?? true) && (mic?.ready ?? true) { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let warmed = CACurrentMediaTime() - warmStart
+        if !screen.ready { err("⚠︎ screen not warm after \(String(format: "%.1f", warmed))s") }
+        if let c = cam, !c.ready { err("⚠︎ camera not warm after \(String(format: "%.1f", warmed))s (phone connected?)") }
+        if let m = mic, !m.ready { err("⚠︎ mic not warm after \(String(format: "%.1f", warmed))s") }
+
+        // ---- phase 3: GO — one shared t0, all writers start together ----
+        let t0 = CACurrentMediaTime()
+        screen.beginWriting(at: t0)
+        cam?.beginWriting(at: t0)
+        mic?.beginWriting(at: t0)
+        err("● recording \(w ?? display.width)x\(h ?? display.height)@\(fps)"
+            + "\(camIdx != nil ? " + camera" : "")\(micIdx != nil ? " + mic" : "")"
+            + "  (warmed in \(String(format: "%.1f", warmed))s)")
 
         func finish() async {
             await screen.stop()
@@ -238,18 +300,18 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             err("screen frames: delivered=\(screen.delivered) written=\(screen.written) dropped=\(screen.delivered - screen.written)")
             if let c = cam { err("camera frames: written=\(c.written)") }
             if let m = mic { err("mic buffers: written=\(m.written)") }
-            // manifest: roll start offsets on the shared host clock (all firstPTS in host seconds)
+            // manifest: with the shared-t0 start, head offsets should now be ~0
             var manifest: [String: Any] = [
-                "version": VERSION, "fps": fps,
-                "screen": ["file": "screen.mp4", "firstPTS": screen.firstPTS],
+                "version": VERSION, "fps": fps, "t0": t0,
+                "screen": ["file": "screen.mp4", "firstPTS": screen.firstWrittenPTS],
             ]
             if let c = cam {
-                manifest["camera"] = ["file": "camera.mp4", "firstPTS": c.firstPTS]
-                manifest["cameraSyncOffsetMs"] = (c.firstPTS - screen.firstPTS) * 1000
+                manifest["camera"] = ["file": "camera.mp4", "firstPTS": c.firstWrittenPTS]
+                manifest["cameraSyncOffsetMs"] = (c.firstWrittenPTS - screen.firstWrittenPTS) * 1000
             }
             if let m = mic {
-                manifest["mic"] = ["file": "mic.m4a", "firstPTS": m.firstPTS]
-                manifest["micSyncOffsetMs"] = (m.firstPTS - screen.firstPTS) * 1000
+                manifest["mic"] = ["file": "mic.m4a", "firstPTS": m.firstWrittenPTS]
+                manifest["micSyncOffsetMs"] = (m.firstWrittenPTS - screen.firstWrittenPTS) * 1000
             }
             if let data = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted]) {
                 try? data.write(to: dir.appendingPathComponent("manifest.json"))
