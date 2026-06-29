@@ -1,0 +1,25 @@
+name: mac-capture
+
+# Remote macOS compiler for the native capture helper. This is the loop the
+# headless dev box uses to build Apple-framework code it can't compile locally:
+# push -> build on a real Mac runner -> read errors -> fix.
+on:
+  push:
+    paths:
+      - "capture-swift/**"
+      - ".github/workflows/mac-capture.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: capture-swift
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: Build
+        run: swift build -c release
+      - name: Smoke (capability report)
+        run: swift run -c release roll-capture
