@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>dev.stumason.roll-capture</string>
+    <key>CFBundleName</key>
+    <string>roll-capture</string>
+    <!-- opt in to the modern Continuity Camera device type instead of the
+         deprecated .external path (silences the warnings and gives the iPhone
+         camera through the supported pipeline) -->
+    <key>NSCameraUseContinuityCameraDeviceType</key>
+    <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>roll-capture records your camera as one source of a capture pack.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>roll-capture records your microphone as one source of a capture pack.</string>
+</dict>
+</plist>

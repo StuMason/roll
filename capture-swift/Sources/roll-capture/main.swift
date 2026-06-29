@@ -18,7 +18,7 @@ import ApplicationServices
 // Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
 // truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.12"
+let VERSION = "0.0.13"
 
 // keyCodes that have no sensible printable character — named so the key stream
 // is legible (charactersIgnoringModifiers returns control/unicode junk for these)
