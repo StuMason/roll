@@ -1,4 +1,4 @@
-// swift-tools-version:5.7
+// swift-tools-version:5.9
 import PackageDescription
 
 // roll-capture — native macOS capture helper for the roll pack.
