@@ -18,7 +18,7 @@ import ApplicationServices
 // Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
 // truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.8"
+let VERSION = "0.0.9"
 
 func argVal(_ name: String) -> String? {
     let a = CommandLine.arguments
@@ -383,7 +383,10 @@ func listAll() async {
     do {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         print("displays:")
-        for (i, d) in content.displays.enumerated() { print("  [\(i)] id=\(d.displayID)  \(d.width)x\(d.height)") }
+        for (i, d) in content.displays.enumerated() {
+            let f = d.frame
+            print("  [\(i)] id=\(d.displayID) x=\(Int(f.origin.x)) y=\(Int(f.origin.y)) w=\(Int(f.size.width)) h=\(Int(f.size.height))")
+        }
     } catch { err("display list failed: \(error)") }
     print("cameras:")
     for (i, d) in cameraDevices().enumerated() { print("  [\(i)] \(d.localizedName)") }
