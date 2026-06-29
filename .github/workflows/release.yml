@@ -8,6 +8,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# tauri-action creates a GitHub release + uploads assets, which needs write.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
