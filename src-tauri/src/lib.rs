@@ -274,6 +274,27 @@ fn build_pack(dir: &Path, id: &str, duration_ms: u64) -> Pack {
     }
 }
 
+#[derive(Serialize)]
+struct PackDetail {
+    manifest: serde_json::Value,
+    events: Vec<serde_json::Value>,
+}
+
+/// A pack's manifest plus its telemetry rows, for the in-app inspector. Media
+/// (screen/camera/mic) is loaded separately by the webview via the asset protocol.
+#[tauri::command]
+fn read_pack(dir: String) -> Result<PackDetail, String> {
+    let p = Path::new(&dir);
+    let manifest = std::fs::read_to_string(p.join("manifest.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let events = std::fs::read_to_string(p.join("metadata.jsonl"))
+        .map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .unwrap_or_default();
+    Ok(PackDetail { manifest, events })
+}
+
 /// Every pack on disk, newest first — the persistent library shown on launch.
 #[tauri::command]
 fn list_packs(app: AppHandle) -> Result<Vec<Pack>, String> {
@@ -454,6 +475,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_devices,
             list_packs,
+            read_pack,
             start_recording,
             stop_recording,
             reveal,

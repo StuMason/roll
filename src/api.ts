@@ -3,7 +3,7 @@
 // browser (vite dev, no Tauri) they fall back to a believable mock so the whole
 // UI — including a simulated take — can be built and eyeballed without a Mac.
 
-import type { Devices, Pack, RecordConfig, StateEvent } from "./types";
+import type { Devices, Pack, PackDetail, RecordConfig, StateEvent } from "./types";
 
 const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -38,6 +38,26 @@ const MOCK_DEVICES: Devices = {
     { index: 6, label: "Logitech C920 Mic" },
   ],
 };
+
+const MOCK_PACKS: Pack[] = [
+  { id: "rec-1782764857110", dir: "~/Movies/roll/rec-1782764857110", durationMs: 89700, sources: ["screen.mp4", "camera.mp4", "mic.m4a", "metadata.jsonl"], rows: 555, cameraSyncOffsetMs: 5, micSyncOffsetMs: 2 },
+  { id: "rec-1782762586924", dir: "~/Movies/roll/rec-1782762586924", durationMs: 26743, sources: ["screen.mp4", "camera.mp4", "mic.m4a", "metadata.jsonl"], rows: 312, cameraSyncOffsetMs: -58, micSyncOffsetMs: -75 },
+];
+
+// a believable slice of telemetry so the inspector can be built without a Mac
+const MOCK_EVENTS = [
+  { type: "app_focus", t_ms: 0, app: "Safari", window: "Pricing — Acme" },
+  { type: "click", t_ms: 1200, x: 640, y: 320, button: "left", ax: { role: "AXButton", label: "Get started" } },
+  { type: "scroll", t_ms: 3400, x: 700, y: 500, dx: 0, dy: -640 },
+  { type: "key", t_ms: 5200, key: "cmd", mods: ["cmd"] },
+  { type: "app_focus", t_ms: 6000, app: "VS Code", window: "api.ts — roll" },
+  { type: "key", t_ms: 7100, key: "f", mods: [] },
+  { type: "key", t_ms: 7250, key: "n", mods: [] },
+  { type: "drag", t_ms: 9000, end_ms: 9600, from: [200, 300], to: [560, 300], button: "left" },
+  { type: "click", t_ms: 12000, x: 880, y: 140, button: "left", ax: { role: "AXTextField", label: "Search" } },
+  { type: "app_focus", t_ms: 15000, app: "Safari", window: "Docs — roll" },
+  { type: "scroll", t_ms: 16000, x: 700, y: 500, dx: 0, dy: -1200 },
+].map((e) => ({ ...e })) as import("./types").TEvent[];
 
 let mockTimer: ReturnType<typeof setInterval> | null = null;
 let mockStart = 0;
@@ -98,6 +118,26 @@ export async function listDevices(): Promise<Devices> {
   if (!isTauri) return MOCK_DEVICES;
   const { core } = await tauri();
   return core.invoke<Devices>("list_devices");
+}
+
+export async function listPacks(): Promise<Pack[]> {
+  if (!isTauri) return MOCK_PACKS;
+  const { core } = await tauri();
+  return core.invoke<Pack[]>("list_packs");
+}
+
+export async function readPack(dir: string): Promise<PackDetail> {
+  if (!isTauri) return { manifest: { durationMs: 89700, fps: 30 }, events: MOCK_EVENTS };
+  const { core } = await tauri();
+  return core.invoke<PackDetail>("read_pack", { dir });
+}
+
+// Turn an on-disk pack file into a webview-loadable URL (asset protocol). Empty
+// in the browser mock — there's no real media there.
+export async function mediaSrc(dir: string, file: string): Promise<string> {
+  if (!isTauri) return "";
+  const { core } = await tauri();
+  return core.convertFileSrc(`${dir}/${file}`);
 }
 
 export async function startRecording(cfg: RecordConfig): Promise<void> {

@@ -50,3 +50,29 @@ export interface StateEvent {
   state: RecState;
   stats: LiveStats;
 }
+
+// One telemetry row from metadata.jsonl. Shape varies by `type`; the common
+// field is t_ms (ms since the shared t0). Loose by design.
+export interface TEvent {
+  type: "click" | "drag" | "cursor" | "key" | "scroll" | "app_focus" | string;
+  t_ms: number;
+  end_ms?: number;
+  x?: number;
+  y?: number;
+  from?: [number, number];
+  to?: [number, number];
+  button?: string;
+  mods?: string[];
+  key?: string;
+  dx?: number;
+  dy?: number;
+  app?: string;
+  window?: string;
+  ax?: { role?: string; label?: string; bounds?: number[] };
+}
+
+export interface PackDetail {
+  // manifest.json verbatim (fps, t0, durationMs, sync offsets, display, …)
+  manifest: Record<string, unknown> | null;
+  events: TEvent[];
+}

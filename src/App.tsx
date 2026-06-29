@@ -1,8 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Dropdown, { Opt } from "./components/Dropdown";
 import CameraPreview from "./components/CameraPreview";
-import { ENGINE, highlightDisplay, listDevices, onState, reveal, screenShot, startRecording, stopRecording } from "./api";
+import PackInspector from "./components/PackInspector";
+import { ENGINE, highlightDisplay, listDevices, listPacks, onState, reveal, screenShot, startRecording, stopRecording } from "./api";
 import type { Devices, LiveStats, Pack, RecState, RecordConfig } from "./types";
+
+const SAVED = "roll.cfg.v1";
+function loadSaved(): Partial<RecordConfig> {
+  try { return JSON.parse(localStorage.getItem(SAVED) || "{}"); } catch { return {}; }
+}
+// keep a saved pick if its device is still plugged in, else fall back
+function resolve(saved: number | null | undefined, list: { index: number }[], fallback: number | null): number | null {
+  if (saved === null) return null;
+  if (saved !== undefined && list.some((x) => x.index === saved)) return saved;
+  return fallback;
+}
 
 const FPS = [24, 30, 60];
 
@@ -23,6 +35,7 @@ export default function App() {
   const [packs, setPacks] = useState<Pack[]>([]);
   const [showPreview, setShowPreview] = useState(true);
   const [shot, setShot] = useState<string | null>(null);
+  const [openPack, setOpenPack] = useState<Pack | null>(null);
 
   const loaded = useRef(false);
 
@@ -38,9 +51,11 @@ export default function App() {
     setDevices(d);
     if (!loaded.current) {
       loaded.current = true;
-      setDisplay(d.displays[0]?.index ?? 0);
-      setCamera(d.cameras[0]?.index ?? null);
-      setMic(d.mics[0]?.index ?? null);
+      const s = loadSaved();
+      setDisplay(resolve(s.display, d.displays, d.displays[0]?.index ?? 0) ?? 0);
+      setCamera(resolve(s.camera, d.cameras, d.cameras[0]?.index ?? null));
+      setMic(resolve(s.mic, d.mics, d.mics[0]?.index ?? null));
+      if (s.fps) setFps(s.fps);
     } else {
       // hot-plug refresh: keep current picks, drop any that were unplugged
       setDisplay((c) => (d.displays.some((x) => x.index === c) ? c : d.displays[0]?.index ?? 0));
@@ -51,6 +66,7 @@ export default function App() {
 
   useEffect(() => {
     loadDevices();
+    listPacks().then(setPacks).catch(() => {});
     const onFocus = () => loadDevices();
     window.addEventListener("focus", onFocus);
     const un = onState((e) => {
@@ -74,6 +90,11 @@ export default function App() {
     () => ({ display, camera, mic, fps }),
     [display, camera, mic, fps],
   );
+
+  // remember the selection across launches
+  useEffect(() => {
+    if (loaded.current) localStorage.setItem(SAVED, JSON.stringify(cfg));
+  }, [cfg]);
 
   const busy = state !== "idle";
   const recording = state === "recording";
@@ -100,7 +121,10 @@ export default function App() {
   }
   async function stop() {
     const pack = await stopRecording(cfg);
-    setPacks((p) => [pack, ...p].slice(0, 8));
+    // disk is the source of truth (exact duration, sync, rows); fall back to the
+    // returned pack if the rescan somehow comes back empty
+    const all = await listPacks().catch(() => [] as Pack[]);
+    setPacks(all.length ? all : (p) => [pack, ...p]);
   }
 
   return (
@@ -193,23 +217,25 @@ export default function App() {
         </section>
 
         <section className="packs">
-          <h2>Recent packs</h2>
+          <h2>Library {packs.length > 0 && <span className="count">{packs.length}</span>}</h2>
           {packs.length === 0 ? (
             <p className="empty">No takes yet — hit record to write your first pack.</p>
           ) : (
             <ul>
               {packs.map((p) => (
                 <li key={p.id}>
-                  <span className="pack-time">{clock(p.durationMs)}</span>
-                  <span className="pack-src">{p.sources.map((s) => s.replace(/\..+$/, "")).join(" · ")}</span>
-                  <span className="pack-meta">
-                    {p.rows != null && <span className="tag">{p.rows} events</span>}
-                    {p.cameraSyncOffsetMs != null && (
-                      <span className={`tag ${Math.abs(p.cameraSyncOffsetMs) < 34 ? "ok" : "warn"}`}>
-                        sync {p.cameraSyncOffsetMs > 0 ? "+" : ""}{p.cameraSyncOffsetMs}ms
-                      </span>
-                    )}
-                  </span>
+                  <button className="pack-open" onClick={() => setOpenPack(p)} title="Open in inspector">
+                    <span className="pack-time">{clock(p.durationMs)}</span>
+                    <span className="pack-src">{p.sources.map((s) => s.replace(/\..+$/, "")).join(" · ")}</span>
+                    <span className="pack-meta">
+                      {p.rows != null && <span className="tag">{p.rows} events</span>}
+                      {p.cameraSyncOffsetMs != null && (
+                        <span className={`tag ${Math.abs(p.cameraSyncOffsetMs) < 34 ? "ok" : "warn"}`}>
+                          sync {p.cameraSyncOffsetMs > 0 ? "+" : ""}{Math.round(p.cameraSyncOffsetMs)}ms
+                        </span>
+                      )}
+                    </span>
+                  </button>
                   <button className="ghost sm" onClick={() => reveal(p.dir)}>Reveal</button>
                 </li>
               ))}
@@ -217,6 +243,8 @@ export default function App() {
           )}
         </section>
       </div>
+
+      {openPack && <PackInspector pack={openPack} onClose={() => setOpenPack(null)} />}
     </main>
   );
 }
