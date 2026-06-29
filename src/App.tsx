@@ -1,113 +1,175 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import type { SourceKind, RecordingResult } from "./types";
+import { useEffect, useMemo, useState } from "react";
+import Dropdown, { Opt } from "./components/Dropdown";
+import CameraPreview from "./components/CameraPreview";
+import { ENGINE, listDevices, onState, reveal, startRecording, stopRecording } from "./api";
+import type { Devices, LiveStats, Pack, RecState, RecordConfig } from "./types";
 
-const ALL: { kind: SourceKind; label: string }[] = [
-  { kind: "screen", label: "Screen" },
-  { kind: "mic", label: "Microphone" },
-  { kind: "camera", label: "Camera" },
-];
+const FPS = [24, 30, 60];
 
-function fmt(ms: number): string {
+function clock(ms: number): string {
   const s = Math.floor(ms / 1000);
-  const mm = String(Math.floor(s / 60)).padStart(2, "0");
-  const ss = String(s % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 }
 
 export default function App() {
-  const [selected, setSelected] = useState<Set<SourceKind>>(new Set(["screen", "mic"]));
-  const [recording, setRecording] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
-  const [last, setLast] = useState<RecordingResult | null>(null);
-  const [backend, setBackend] = useState("");
+  const [devices, setDevices] = useState<Devices | null>(null);
+  const [display, setDisplay] = useState(0);
+  const [camera, setCamera] = useState<number | null>(null);
+  const [mic, setMic] = useState<number | null>(null);
+  const [fps, setFps] = useState(30);
+
+  const [state, setState] = useState<RecState>("idle");
+  const [stats, setStats] = useState<LiveStats>({ elapsedMs: 0 });
+  const [packs, setPacks] = useState<Pack[]>([]);
+  const [showPreview, setShowPreview] = useState(true);
 
   useEffect(() => {
-    invoke<string>("backend_name").then(setBackend).catch(() => {});
-    const un = listen<number>("roll://tick", (e) => setElapsed(e.payload));
+    listDevices().then((d) => {
+      setDevices(d);
+      setDisplay(d.displays[0]?.index ?? 0);
+      setCamera(d.cameras[0]?.index ?? null);
+      setMic(d.mics[0]?.index ?? null);
+    });
+    const un = onState((e) => {
+      setState(e.state);
+      setStats(e.stats);
+    });
     return () => {
       un.then((f) => f());
     };
   }, []);
 
-  const toggle = (k: SourceKind) =>
-    setSelected((s) => {
-      const n = new Set(s);
-      if (n.has(k)) n.delete(k);
-      else n.add(k);
-      return n;
-    });
+  const cfg: RecordConfig = useMemo(
+    () => ({ display, camera, mic, fps }),
+    [display, camera, mic, fps],
+  );
+
+  const busy = state !== "idle";
+  const recording = state === "recording";
+
+  const displayOpts: Opt[] = (devices?.displays ?? []).map((d) => ({ value: d.index, label: d.label }));
+  const cameraOpts: Opt[] = [{ value: null, label: "None" }, ...(devices?.cameras ?? []).map((d) => ({ value: d.index, label: d.label }))];
+  const micOpts: Opt[] = [{ value: null, label: "None" }, ...(devices?.mics ?? []).map((d) => ({ value: d.index, label: d.label }))];
+
+  const cameraLabel = devices?.cameras.find((c) => c.index === camera)?.label ?? "";
+  const displayLabel = devices?.displays.find((d) => d.index === display)?.label ?? "";
 
   async function start() {
-    setElapsed(0);
-    setLast(null);
-    await invoke("start_recording", { config: { sources: [...selected], fps: 30 } });
-    setRecording(true);
+    await startRecording(cfg);
   }
-
   async function stop() {
-    const res = await invoke<RecordingResult>("stop_recording");
-    setRecording(false);
-    setLast(res);
+    const pack = await stopRecording(cfg);
+    setPacks((p) => [pack, ...p].slice(0, 8));
   }
 
   return (
-    <main className="wrap">
-      <header>
-        <h1>
-          <span className={recording ? "dot live" : "dot"} /> roll
-        </h1>
-        <span className="backend" title="active capture backend">
-          {backend}
-        </span>
+    <main className="app">
+      <header className="titlebar" data-tauri-drag-region>
+        <div className="brand">
+          <span className={`reel${recording ? " live" : ""}`} />
+          <span className="brand-name">roll</span>
+        </div>
+        <span className="engine" title="active capture engine">{ENGINE}</span>
       </header>
 
-      <section className="sources">
-        {ALL.map(({ kind, label }) => (
-          <label key={kind} className={selected.has(kind) ? "on" : ""}>
-            <input
-              type="checkbox"
-              checked={selected.has(kind)}
-              disabled={recording}
-              onChange={() => toggle(kind)}
-            />
-            {label}
-          </label>
-        ))}
-      </section>
+      <div className="body">
+        {showPreview && (
+          <section className="previews">
+            <CameraPreview cameraIndex={camera} cameraLabel={cameraLabel} recording={recording} />
+            <div className={`screen-card${recording ? " rec" : ""}`}>
+              <div className="screen-mock">
+                <span className="screen-grid" />
+                <span className="screen-cursor" />
+              </div>
+              <div className="screen-meta">
+                <span className="screen-name">{displayLabel || "Display"}</span>
+                <span className="screen-sub">screen · captured at native res</span>
+              </div>
+              <span className="cam-badge">SCREEN</span>
+            </div>
+          </section>
+        )}
 
-      <div className={recording ? "timer live" : "timer"}>{fmt(elapsed)}</div>
-
-      {recording ? (
-        <button className="btn stop" onClick={stop}>
-          Stop
-        </button>
-      ) : (
-        <button className="btn rec" disabled={selected.size === 0} onClick={start}>
-          Record
-        </button>
-      )}
-
-      {last && (
-        <section className="result">
-          <h2>last take · {fmt(last.durationMs)}</h2>
-          <code className="dir">{last.dir}</code>
-          <ul>
-            {last.sources.map((s) => (
-              <li key={s.kind}>
-                <b>{s.kind}</b> → {s.file}
-              </li>
-            ))}
-            <li>
-              <b>events</b> → metadata.jsonl
-            </li>
-            <li>
-              <b>manifest</b> → manifest.json
-            </li>
-          </ul>
+        <section className="controls">
+          <div className="row">
+            <Dropdown label="Display" value={display} options={displayOpts} onChange={(v) => setDisplay(v ?? 0)} disabled={busy} />
+            <button className="ghost" onClick={() => setShowPreview((s) => !s)}>
+              {showPreview ? "Hide preview" : "Show preview"}
+            </button>
+          </div>
+          <div className="row two">
+            <Dropdown label="Camera" value={camera} options={cameraOpts} onChange={setCamera} disabled={busy} />
+            <Dropdown label="Microphone" value={mic} options={micOpts} onChange={setMic} disabled={busy} />
+          </div>
+          <div className="field">
+            <span className="field-label">Frame rate</span>
+            <div className="seg">
+              {FPS.map((f) => (
+                <button key={f} className={f === fps ? "on" : ""} disabled={busy} onClick={() => setFps(f)}>
+                  {f}
+                </button>
+              ))}
+            </div>
+          </div>
         </section>
-      )}
+
+        <section className={`recordbar ${state}`}>
+          {state === "idle" && (
+            <button className="record" onClick={start}>
+              <span className="record-dot" /> Record
+            </button>
+          )}
+          {state === "warming" && (
+            <button className="record warming" onClick={stop}>
+              <span className="spinner" /> Warming up…<small>connecting sources</small>
+            </button>
+          )}
+          {recording && (
+            <button className="record stop" onClick={stop}>
+              <span className="stop-sq" /> Stop
+            </button>
+          )}
+          {state === "saving" && (
+            <div className="record saving"><span className="spinner" /> Saving pack…</div>
+          )}
+
+          <div className="readout">
+            <span className={`time${recording ? " live" : ""}`}>{clock(stats.elapsedMs)}</span>
+            {recording && (
+              <div className="livestats">
+                <span><b>{stats.screenFrames ?? 0}</b> frames</span>
+                <span><b>{stats.clicks ?? 0}</b> clicks</span>
+                {stats.warmedMs !== undefined && <span className="warmed">warmed {(stats.warmedMs / 1000).toFixed(1)}s</span>}
+              </div>
+            )}
+          </div>
+        </section>
+
+        <section className="packs">
+          <h2>Recent packs</h2>
+          {packs.length === 0 ? (
+            <p className="empty">No takes yet — hit record to write your first pack.</p>
+          ) : (
+            <ul>
+              {packs.map((p) => (
+                <li key={p.id}>
+                  <span className="pack-time">{clock(p.durationMs)}</span>
+                  <span className="pack-src">{p.sources.map((s) => s.replace(/\..+$/, "")).join(" · ")}</span>
+                  <span className="pack-meta">
+                    {p.rows != null && <span className="tag">{p.rows} events</span>}
+                    {p.cameraSyncOffsetMs != null && (
+                      <span className={`tag ${Math.abs(p.cameraSyncOffsetMs) < 34 ? "ok" : "warn"}`}>
+                        sync {p.cameraSyncOffsetMs > 0 ? "+" : ""}{p.cameraSyncOffsetMs}ms
+                      </span>
+                    )}
+                  </span>
+                  <button className="ghost sm" onClick={() => reveal(p.dir)}>Reveal</button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      </div>
     </main>
   );
 }

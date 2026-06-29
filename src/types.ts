@@ -1,31 +1,47 @@
-// Mirror of the Rust contract in src-tauri/src/pack.rs.
-// Keep these in lockstep — this is the JS side of the IPC boundary.
+// The JS side of the IPC boundary. Mirrors the Rust contract where it crosses
+// (see src-tauri/src/lib.rs commands + events).
 
-export type SourceKind = "screen" | "camera" | "mic";
-
-export interface SourceInfo {
-  kind: SourceKind;
-  id: string;
+export interface Device {
+  index: number;
   label: string;
 }
 
+export interface Devices {
+  displays: Device[];
+  cameras: Device[];
+  mics: Device[];
+}
+
+export type RecState = "idle" | "warming" | "recording" | "saving";
+
+export interface LiveStats {
+  warmedMs?: number;
+  elapsedMs: number;
+  screenFrames?: number;
+  cameraFrames?: number;
+  clicks?: number;
+  rows?: number;
+}
+
 export interface RecordConfig {
-  sources: SourceKind[];
+  display: number;
+  camera: number | null;
+  mic: number | null;
   fps: number;
 }
 
-export interface PackSource {
-  kind: SourceKind;
-  file: string;
-  fps: number;
-  width?: number;
-  height?: number;
-  offsetMs: number;
-}
-
-export interface RecordingResult {
+export interface Pack {
   id: string;
   dir: string;
   durationMs: number;
-  sources: PackSource[];
+  sources: string[]; // e.g. ["screen.mp4","camera.mp4","mic.m4a","metadata.jsonl"]
+  rows?: number; // metadata rows
+  cameraSyncOffsetMs?: number;
+  micSyncOffsetMs?: number;
+}
+
+// Payload of the "roll://state" event the backend emits while a take runs.
+export interface StateEvent {
+  state: RecState;
+  stats: LiveStats;
 }
