@@ -12,12 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "Roll",
-        "width": 360,
-        "height": 520,
+        "title": "roll",
+        "width": 920,
+        "height": 860,
         "resizable": true,
-        "minWidth": 320,
-        "minHeight": 420
+        "minWidth": 760,
+        "minHeight": 600
       }
     ],
     "security": {

@@ -7,7 +7,6 @@ export interface Opt {
 }
 
 interface Props {
-  label: string;
   value: number | null;
   options: Opt[];
   onChange: (v: number | null) => void;
@@ -15,7 +14,7 @@ interface Props {
   icon?: React.ReactNode;
 }
 
-export default function Dropdown({ label, value, options, onChange, disabled, icon }: Props) {
+export default function Dropdown({ value, options, onChange, disabled, icon }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const cur = options.find((o) => o.value === value);
@@ -35,9 +34,7 @@ export default function Dropdown({ label, value, options, onChange, disabled, ic
   }, [open]);
 
   return (
-    <div className="field">
-      <span className="field-label">{label}</span>
-      <div className={`dd${open ? " open" : ""}`} ref={ref}>
+    <div className={`dd${open ? " open" : ""}`} ref={ref}>
         <button
           type="button"
           className="dd-trigger"
@@ -74,7 +71,6 @@ export default function Dropdown({ label, value, options, onChange, disabled, ic
             ))}
           </ul>
         )}
-      </div>
     </div>
   );
 }
