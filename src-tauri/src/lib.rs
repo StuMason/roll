@@ -227,6 +227,16 @@ fn reader_loop(app: AppHandle, stderr: std::process::ChildStderr) {
     }
 }
 
+/// Last telemetry timestamp — a good proxy for take length when a pack was
+/// written before the engine recorded `durationMs` in its manifest.
+fn last_event_ms(dir: &Path) -> Option<u64> {
+    let txt = std::fs::read_to_string(dir.join("metadata.jsonl")).ok()?;
+    txt.lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .and_then(|v| v.get("t_ms").and_then(|x| x.as_u64()))
+}
+
 fn build_pack(dir: &Path, id: &str, duration_ms: u64) -> Pack {
     let mut sources = Vec::new();
     for f in ["screen.mp4", "camera.mp4", "mic.m4a", "metadata.jsonl"] {
@@ -238,13 +248,21 @@ fn build_pack(dir: &Path, id: &str, duration_ms: u64) -> Pack {
         .ok()
         .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count() as u32);
 
-    let (mut camera_sync_offset_ms, mut mic_sync_offset_ms) = (None, None);
+    let (mut camera_sync_offset_ms, mut mic_sync_offset_ms, mut manifest_dur) = (None, None, None);
     if let Ok(txt) = std::fs::read_to_string(dir.join("manifest.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
             camera_sync_offset_ms = v.get("cameraSyncOffsetMs").and_then(|x| x.as_f64());
             mic_sync_offset_ms = v.get("micSyncOffsetMs").and_then(|x| x.as_f64());
+            manifest_dur = v.get("durationMs").and_then(|x| x.as_f64()).map(|d| d as u64);
         }
     }
+    // live recordings pass a real duration; for listed past packs (duration_ms==0)
+    // prefer the manifest, then fall back to the last event timestamp
+    let duration_ms = if duration_ms > 0 {
+        duration_ms
+    } else {
+        manifest_dur.or_else(|| last_event_ms(dir)).unwrap_or(0)
+    };
     Pack {
         id: id.to_string(),
         dir: dir.to_string_lossy().into_owned(),
@@ -254,6 +272,27 @@ fn build_pack(dir: &Path, id: &str, duration_ms: u64) -> Pack {
         camera_sync_offset_ms,
         mic_sync_offset_ms,
     }
+}
+
+/// Every pack on disk, newest first — the persistent library shown on launch.
+#[tauri::command]
+fn list_packs(app: AppHandle) -> Result<Vec<Pack>, String> {
+    let root = recordings_root(&app);
+    let mut packs = Vec::new();
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return Ok(packs), // no recordings dir yet
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if dir.is_dir() && name.starts_with("rec-") && dir.join("manifest.json").exists() {
+            packs.push(build_pack(&dir, &name, 0));
+        }
+    }
+    // rec-<epoch_ms>, so lexical sort on id is chronological; newest first
+    packs.sort_by(|a, b| b.id.cmp(&a.id));
+    Ok(packs)
 }
 
 // ---- commands ----
@@ -414,6 +453,7 @@ pub fn run() {
         .manage(AppState(Mutex::new(RecorderState::default())))
         .invoke_handler(tauri::generate_handler![
             list_devices,
+            list_packs,
             start_recording,
             stop_recording,
             reveal,

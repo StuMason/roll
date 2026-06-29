@@ -604,7 +604,8 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             telemetry.stop()
             // hold the screen's final frame out to the stop instant so screen.mp4
             // spans the whole take even if the screen was static at the end
-            screen.finalize(at: CACurrentMediaTime())
+            let stopT = CACurrentMediaTime()
+            screen.finalize(at: stopT)
             await screen.stop()
             if let c = cam { await c.stop() }
             if let m = mic { await m.stop() }
@@ -614,7 +615,7 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             err("metadata rows: \(telemetry.rows)\(telemetry.ok ? "" : " (telemetry off — no Accessibility)")")
             let f = display.frame
             var manifest: [String: Any] = [
-                "version": VERSION, "fps": fps, "t0": t0,
+                "version": VERSION, "fps": fps, "t0": t0, "durationMs": (stopT - t0) * 1000,
                 "display": ["id": display.displayID, "x": Int(f.origin.x), "y": Int(f.origin.y),
                             "w": Int(f.size.width), "h": Int(f.size.height)],
                 "screen": ["file": "screen.mp4", "firstPTS": screen.firstWrittenPTS],
