@@ -1,0 +1,53 @@
+name: app-mac
+
+# Compile-validate the whole desktop app on a real macOS runner: the Swift
+# sidecar, the frontend, and the Rust shell (clippy + tests). This is the loop
+# the headless Linux box uses to check the Tauri+sidecar wiring it can't build
+# locally. Functional capture still needs a real Mac with permissions.
+on:
+  push:
+    paths:
+      - "src/**"
+      - "src-tauri/**"
+      - "capture-swift/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/app-mac.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: macos-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Build sidecar
+        run: cd capture-swift && swift build -c release
+
+      - run: npm ci
+      - name: Frontend build
+        run: npm run build
+
+      - name: clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
