@@ -309,7 +309,7 @@ final class Telemetry {
         let loc = event.location   // global display points, top-left origin
         switch type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            down[button(type)] = (loc.x, loc.y, now)
+            down[button(type)] = (Double(loc.x), Double(loc.y), now)
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
             let b = button(type)
             guard let d = down.removeValue(forKey: b) else { break }
