@@ -13,11 +13,12 @@ import ApplicationServices
 //   1. arm()        — start every capture session; frames flow but aren't written
 //   2. (warm wait)  — block until all sources have delivered a first frame
 //   3. beginWriting(at t0) — flip all writers on at ONE shared host-clock t0
-// Result: screen.mp4 + camera.mp4 + mic.m4a all start at the same instant,
-// no startup lag eaten from the head, no ding mid-take. manifest.json records
-// each roll's first written PTS so the cruncher can verify alignment.
+//
+// Stops on: --secs deadline, SIGINT (terminal), OR a line/EOF on stdin (so the
+// Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
+// truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.7"
+let VERSION = "0.0.8"
 
 func argVal(_ name: String) -> String? {
     let a = CommandLine.arguments
@@ -107,7 +108,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         else { return }
         ready = true
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard pts.seconds >= writeFrom else { return }   // still arming — drop pre-t0 frames
+        guard pts.seconds >= writeFrom else { return }
         delivered += 1
         if input.isReadyForMoreMediaData {
             input.append(sampleBuffer); written += 1
@@ -227,9 +228,6 @@ final class MicRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate 
 }
 
 // ---- telemetry (CGEventTap input + Accessibility semantics) ----
-// Stamped on the SAME host clock as the video t0, so metadata.jsonl rows align
-// to the rolls. Coords are global display POINTS, top-left origin (same space as
-// the AX queries). Needs Accessibility permission for the granting terminal/app.
 final class Telemetry {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
@@ -241,6 +239,7 @@ final class Telemetry {
     private var lastCursor: Double = 0
     private let q = DispatchQueue(label: "roll.telemetry.enrich")
     private(set) var rows = 0
+    private(set) var clicks = 0
     private(set) var ok = false
 
     func start(outURL: URL, t0: Double) {
@@ -265,7 +264,7 @@ final class Telemetry {
                 return Unmanaged.passUnretained(event)
             }, userInfo: ptr)
         else {
-            err("⚠︎ telemetry: event tap failed — grant Accessibility to this terminal (recording continues without metadata)")
+            err("⚠︎ telemetry: event tap failed — grant Accessibility to this app (recording continues without metadata)")
             return
         }
         self.tap = tap
@@ -306,13 +305,14 @@ final class Telemetry {
 
     private func handle(type: CGEventType, event: CGEvent) {
         let now = CACurrentMediaTime()
-        let loc = event.location   // global display points, top-left origin
+        let loc = event.location
         switch type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             down[button(type)] = (Double(loc.x), Double(loc.y), now)
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
             let b = button(type)
             guard let d = down.removeValue(forKey: b) else { break }
+            clicks += 1
             let moved = hypot(loc.x - d.x, loc.y - d.y)
             let sx = d.x, sy = d.y, st = d.t, tx = loc.x, ty = loc.y, m = mods
             q.async {
@@ -325,7 +325,7 @@ final class Telemetry {
                 self.write(row)
             }
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged:
-            if now - lastCursor >= 0.1 {   // ~10Hz
+            if now - lastCursor >= 0.1 {
                 lastCursor = now
                 write(["type": "cursor", "t_ms": stamp(now), "x": Int(loc.x), "y": Int(loc.y)])
             }
@@ -338,7 +338,6 @@ final class Telemetry {
         }
     }
 
-    // --- Accessibility enrichment (off the tap thread) ---
     private func axCopy(_ el: AXUIElement, _ attr: String) -> CFTypeRef? {
         var v: CFTypeRef?
         return AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success ? v : nil
@@ -450,7 +449,15 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             + "\(camIdx != nil ? " + camera" : "")\(micIdx != nil ? " + mic" : "")"
             + "\(telemetry.ok ? " + meta" : "")  (warmed in \(String(format: "%.1f", warmed))s)")
 
+        var finishing = false
+        let progress = DispatchSource.makeTimerSource(queue: .main)
+        let stdinSrc = DispatchSource.makeReadSource(fileDescriptor: STDIN_FILENO, queue: .main)
+
         func finish() async {
+            if finishing { return }
+            finishing = true
+            progress.cancel()
+            stdinSrc.cancel()
             telemetry.stop()
             await screen.stop()
             if let c = cam { await c.stop() }
@@ -459,8 +466,6 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             if let c = cam { err("camera frames: written=\(c.written)") }
             if let m = mic { err("mic buffers: written=\(m.written)") }
             err("metadata rows: \(telemetry.rows)\(telemetry.ok ? "" : " (telemetry off — no Accessibility)")")
-            // manifest: with the shared-t0 start, head offsets should now be ~0.
-            // display frame = global points (top-left) so the join maps clicks -> video pixels.
             let f = display.frame
             var manifest: [String: Any] = [
                 "version": VERSION, "fps": fps, "t0": t0,
@@ -484,14 +489,26 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             exit(0)
         }
 
+        // live progress for the UI — elapsed/frames/clicks every 0.5s
+        progress.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        progress.setEventHandler {
+            let el = Int((CACurrentMediaTime() - t0) * 1000)
+            err("progress elapsed=\(el) screen=\(screen.written) camera=\(cam?.written ?? 0) clicks=\(telemetry.clicks) rows=\(telemetry.rows)")
+        }
+        progress.resume()
+
+        // graceful stop when the parent (Tauri) writes a line or closes stdin
+        stdinSrc.setEventHandler { Task { await finish() } }
+        stdinSrc.resume()
+
         if secs > 0 {
             try await Task.sleep(nanoseconds: UInt64(secs * 1_000_000_000))
             await finish()
         } else {
-            let src = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+            let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
             signal(SIGINT, SIG_IGN)
-            src.setEventHandler { Task { await finish() } }
-            src.resume()
+            sig.setEventHandler { Task { await finish() } }
+            sig.resume()
             try await Task.sleep(nanoseconds: UInt64.max)
         }
     } catch { err("capture failed: \(error)"); exit(1) }
@@ -503,6 +520,7 @@ if args.contains("--help") || args.contains("-h") {
     roll-capture \(VERSION)
       --list
       --screen <i> [--cam <i>] [--mic <i>] --out <dir> [--fps 30] [--secs N] [--width W --height H]
+    stop: --secs deadline, SIGINT, or a line / EOF on stdin
     """)
     exit(0)
 }
