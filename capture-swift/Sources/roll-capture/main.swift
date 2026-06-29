@@ -3,6 +3,8 @@ import AVFoundation
 import ScreenCaptureKit
 import CoreMedia
 import QuartzCore
+import AppKit
+import ApplicationServices
 
 // roll-capture — native macOS capture helper for the roll pack.
 //
@@ -15,7 +17,7 @@ import QuartzCore
 // no startup lag eaten from the head, no ding mid-take. manifest.json records
 // each roll's first written PTS so the cruncher can verify alignment.
 
-let VERSION = "0.0.6"
+let VERSION = "0.0.7"
 
 func argVal(_ name: String) -> String? {
     let a = CommandLine.arguments
@@ -224,6 +226,159 @@ final class MicRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate 
     }
 }
 
+// ---- telemetry (CGEventTap input + Accessibility semantics) ----
+// Stamped on the SAME host clock as the video t0, so metadata.jsonl rows align
+// to the rolls. Coords are global display POINTS, top-left origin (same space as
+// the AX queries). Needs Accessibility permission for the granting terminal/app.
+final class Telemetry {
+    private var tap: CFMachPort?
+    private var source: CFRunLoopSource?
+    private var file: FileHandle?
+    private var t0: Double = 0
+    private let sys = AXUIElementCreateSystemWide()
+    private var mods: [String] = []
+    private var down: [String: (x: Double, y: Double, t: Double)] = [:]
+    private var lastCursor: Double = 0
+    private let q = DispatchQueue(label: "roll.telemetry.enrich")
+    private(set) var rows = 0
+    private(set) var ok = false
+
+    func start(outURL: URL, t0: Double) {
+        self.t0 = t0
+        FileManager.default.createFile(atPath: outURL.path, contents: nil)
+        file = try? FileHandle(forWritingTo: outURL)
+
+        let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+                                    .otherMouseDown, .otherMouseUp, .mouseMoved,
+                                    .leftMouseDragged, .rightMouseDragged, .keyDown, .flagsChanged]
+        var mask: CGEventMask = 0
+        for t in types { mask |= (CGEventMask(1) << t.rawValue) }
+
+        let ptr = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+            eventsOfInterest: mask,
+            callback: { _, type, event, refcon in
+                if let refcon = refcon {
+                    Unmanaged<Telemetry>.fromOpaque(refcon).takeUnretainedValue().handle(type: type, event: event)
+                }
+                return Unmanaged.passUnretained(event)
+            }, userInfo: ptr)
+        else {
+            err("⚠︎ telemetry: event tap failed — grant Accessibility to this terminal (recording continues without metadata)")
+            return
+        }
+        self.tap = tap
+        source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        ok = true
+    }
+
+    func stop() {
+        if let tap = tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        try? file?.synchronize(); try? file?.close()
+    }
+
+    private func stamp(_ t: Double) -> Int { Int((t - t0) * 1000) }
+
+    private func write(_ obj: [String: Any]) {
+        guard let f = file, let d = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        f.write(d); f.write(Data([0x0a])); rows += 1
+    }
+
+    private func button(_ type: CGEventType) -> String {
+        switch type {
+        case .leftMouseDown, .leftMouseUp: return "left"
+        case .rightMouseDown, .rightMouseUp: return "right"
+        default: return "other"
+        }
+    }
+
+    private func modNames(_ f: CGEventFlags) -> [String] {
+        var m: [String] = []
+        if f.contains(.maskCommand) { m.append("cmd") }
+        if f.contains(.maskShift) { m.append("shift") }
+        if f.contains(.maskControl) { m.append("ctrl") }
+        if f.contains(.maskAlternate) { m.append("alt") }
+        return m
+    }
+
+    private func handle(type: CGEventType, event: CGEvent) {
+        let now = CACurrentMediaTime()
+        let loc = event.location   // global display points, top-left origin
+        switch type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            down[button(type)] = (loc.x, loc.y, now)
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            let b = button(type)
+            guard let d = down.removeValue(forKey: b) else { break }
+            let moved = hypot(loc.x - d.x, loc.y - d.y)
+            let sx = d.x, sy = d.y, st = d.t, tx = loc.x, ty = loc.y, m = mods
+            q.async {
+                let ctx = self.contextAt(sx, sy)
+                var row: [String: Any] = moved > 8
+                    ? ["type": "drag", "t_ms": self.stamp(st), "end_ms": self.stamp(now),
+                       "from": [Int(sx), Int(sy)], "to": [Int(tx), Int(ty)], "button": b, "mods": m]
+                    : ["type": "click", "t_ms": self.stamp(st), "x": Int(sx), "y": Int(sy), "button": b, "mods": m]
+                row.merge(ctx) { a, _ in a }
+                self.write(row)
+            }
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged:
+            if now - lastCursor >= 0.1 {   // ~10Hz
+                lastCursor = now
+                write(["type": "cursor", "t_ms": stamp(now), "x": Int(loc.x), "y": Int(loc.y)])
+            }
+        case .keyDown:
+            let k = NSEvent(cgEvent: event)?.charactersIgnoringModifiers ?? ""
+            write(["type": "key", "t_ms": stamp(now), "key": k, "mods": mods])
+        case .flagsChanged:
+            mods = modNames(event.flags)
+        default: break
+        }
+    }
+
+    // --- Accessibility enrichment (off the tap thread) ---
+    private func axCopy(_ el: AXUIElement, _ attr: String) -> CFTypeRef? {
+        var v: CFTypeRef?
+        return AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success ? v : nil
+    }
+    private func axString(_ el: AXUIElement, _ attr: String) -> String? {
+        guard let v = axCopy(el, attr) else { return nil }
+        return CFGetTypeID(v) == CFStringGetTypeID() ? ((v as! CFString) as String) : nil
+    }
+    private func axBounds(_ el: AXUIElement) -> [Int]? {
+        guard let p = axCopy(el, kAXPositionAttribute), let s = axCopy(el, kAXSizeAttribute) else { return nil }
+        var pt = CGPoint.zero, sz = CGSize.zero
+        AXValueGetValue(p as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(s as! AXValue, .cgSize, &sz)
+        return [Int(pt.x), Int(pt.y), Int(sz.width), Int(sz.height)]
+    }
+    private func focusedWindow(_ pid: pid_t) -> String? {
+        let app = AXUIElementCreateApplication(pid)
+        guard let w = axCopy(app, kAXFocusedWindowAttribute) else { return nil }
+        return axString(w as! AXUIElement, kAXTitleAttribute)
+    }
+    private func contextAt(_ x: Double, _ y: Double) -> [String: Any] {
+        var out: [String: Any] = [:]
+        if let app = NSWorkspace.shared.frontmostApplication {
+            out["app"] = app.localizedName ?? ""
+            if let t = focusedWindow(app.processIdentifier) { out["window"] = t }
+        }
+        var el: AXUIElement?
+        if AXUIElementCopyElementAtPosition(sys, Float(x), Float(y), &el) == .success, let el = el {
+            var ax: [String: Any] = [:]
+            if let r = axString(el, kAXRoleAttribute) { ax["role"] = r }
+            if let l = axString(el, kAXTitleAttribute) ?? axString(el, kAXDescriptionAttribute) ?? axString(el, kAXValueAttribute) {
+                ax["label"] = String(l.prefix(90))
+            }
+            if let b = axBounds(el) { ax["bounds"] = b }
+            out["ax"] = ax
+        }
+        return out
+    }
+}
+
 @available(macOS 13.0, *)
 func listAll() async {
     do {
@@ -289,21 +444,30 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
         screen.beginWriting(at: t0)
         cam?.beginWriting(at: t0)
         mic?.beginWriting(at: t0)
+        let telemetry = Telemetry()
+        telemetry.start(outURL: dir.appendingPathComponent("metadata.jsonl"), t0: t0)
         err("● recording \(w ?? display.width)x\(h ?? display.height)@\(fps)"
             + "\(camIdx != nil ? " + camera" : "")\(micIdx != nil ? " + mic" : "")"
-            + "  (warmed in \(String(format: "%.1f", warmed))s)")
+            + "\(telemetry.ok ? " + meta" : "")  (warmed in \(String(format: "%.1f", warmed))s)")
 
         func finish() async {
+            telemetry.stop()
             await screen.stop()
             if let c = cam { await c.stop() }
             if let m = mic { await m.stop() }
             err("screen frames: delivered=\(screen.delivered) written=\(screen.written) dropped=\(screen.delivered - screen.written)")
             if let c = cam { err("camera frames: written=\(c.written)") }
             if let m = mic { err("mic buffers: written=\(m.written)") }
-            // manifest: with the shared-t0 start, head offsets should now be ~0
+            err("metadata rows: \(telemetry.rows)\(telemetry.ok ? "" : " (telemetry off — no Accessibility)")")
+            // manifest: with the shared-t0 start, head offsets should now be ~0.
+            // display frame = global points (top-left) so the join maps clicks -> video pixels.
+            let f = display.frame
             var manifest: [String: Any] = [
                 "version": VERSION, "fps": fps, "t0": t0,
+                "display": ["id": display.displayID, "x": Int(f.origin.x), "y": Int(f.origin.y),
+                            "w": Int(f.size.width), "h": Int(f.size.height)],
                 "screen": ["file": "screen.mp4", "firstPTS": screen.firstWrittenPTS],
+                "metadata": telemetry.ok ? "metadata.jsonl" : NSNull(),
             ]
             if let c = cam {
                 manifest["camera"] = ["file": "camera.mp4", "firstPTS": c.firstWrittenPTS]
