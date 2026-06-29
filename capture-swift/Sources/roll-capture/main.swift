@@ -18,7 +18,17 @@ import ApplicationServices
 // Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
 // truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.11"
+let VERSION = "0.0.12"
+
+// keyCodes that have no sensible printable character — named so the key stream
+// is legible (charactersIgnoringModifiers returns control/unicode junk for these)
+let NAMED_KEYS: [Int: String] = [
+    36: "return", 48: "tab", 49: "space", 51: "delete", 53: "escape", 76: "enter",
+    117: "fwd-delete", 115: "home", 119: "end", 116: "page-up", 121: "page-down",
+    123: "left", 124: "right", 125: "down", 126: "up",
+    122: "f1", 120: "f2", 99: "f3", 118: "f4", 96: "f5", 97: "f6", 98: "f7",
+    100: "f8", 101: "f9", 109: "f10", 103: "f11", 111: "f12",
+]
 
 // macOS injects system "video effects" (Center Stage auto-framing, Portrait
 // blur, Studio Light) into ANY camera feed. They mutate the image mid-take — a
@@ -295,6 +305,11 @@ final class Telemetry {
     private var mods: [String] = []
     private var down: [String: (x: Double, y: Double, t: Double)] = [:]
     private var lastCursor: Double = 0
+    private var lastScroll: Double = 0
+    private var scrollDX: Double = 0
+    private var scrollDY: Double = 0
+    private var focusObserver: NSObjectProtocol?
+    private var lastApp: String = ""
     private let q = DispatchQueue(label: "roll.telemetry.enrich")
     private(set) var rows = 0
     private(set) var clicks = 0
@@ -305,9 +320,20 @@ final class Telemetry {
         FileManager.default.createFile(atPath: outURL.path, contents: nil)
         file = try? FileHandle(forWritingTo: outURL)
 
+        // baseline foreground app at t0, then a row on every app switch — gives a
+        // continuous app/window context timeline, not just context at click time
+        emitAppFocus(NSWorkspace.shared.frontmostApplication, at: t0)
+        focusObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self?.emitAppFocus(app, at: CACurrentMediaTime())
+        }
+
         let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
                                     .otherMouseDown, .otherMouseUp, .mouseMoved,
-                                    .leftMouseDragged, .rightMouseDragged, .keyDown, .flagsChanged]
+                                    .leftMouseDragged, .rightMouseDragged, .scrollWheel,
+                                    .keyDown, .flagsChanged]
         var mask: CGEventMask = 0
         for t in types { mask |= (CGEventMask(1) << t.rawValue) }
 
@@ -334,7 +360,28 @@ final class Telemetry {
 
     func stop() {
         if let tap = tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let o = focusObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
+        flushScroll(at: CACurrentMediaTime())
         try? file?.synchronize(); try? file?.close()
+    }
+
+    private func emitAppFocus(_ app: NSRunningApplication?, at t: Double) {
+        guard let app = app, let name = app.localizedName, name != lastApp else { return }
+        lastApp = name
+        let pid = app.processIdentifier, ts = stamp(t)
+        q.async {
+            var row: [String: Any] = ["type": "app_focus", "t_ms": ts, "app": name]
+            if let w = self.focusedWindow(pid) { row["window"] = w }
+            self.write(row)
+        }
+    }
+
+    // scroll fires in dense momentum bursts — accumulate deltas and emit at 10Hz
+    private func flushScroll(at t: Double) {
+        if scrollDX != 0 || scrollDY != 0 {
+            write(["type": "scroll", "t_ms": stamp(t), "dx": Int(scrollDX), "dy": Int(scrollDY)])
+            scrollDX = 0; scrollDY = 0
+        }
     }
 
     private func stamp(_ t: Double) -> Int { Int((t - t0) * 1000) }
@@ -387,8 +434,21 @@ final class Telemetry {
                 lastCursor = now
                 write(["type": "cursor", "t_ms": stamp(now), "x": Int(loc.x), "y": Int(loc.y)])
             }
+        case .scrollWheel:
+            // axis1 = vertical, axis2 = horizontal (point deltas)
+            scrollDY += event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
+            scrollDX += event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
+            if now - lastScroll >= 0.1 {
+                lastScroll = now
+                write(["type": "scroll", "t_ms": stamp(now), "x": Int(loc.x), "y": Int(loc.y),
+                       "dx": Int(scrollDX), "dy": Int(scrollDY)])
+                scrollDX = 0; scrollDY = 0
+            }
         case .keyDown:
-            let k = NSEvent(cgEvent: event)?.charactersIgnoringModifiers ?? ""
+            let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+            let char = NSEvent(cgEvent: event)?.charactersIgnoringModifiers ?? ""
+            // prefer a friendly name for non-printable keys; fall back to the char
+            let k = NAMED_KEYS[code] ?? (char.first.map { $0.isLetter || $0.isNumber || $0.isPunctuation || $0.isSymbol || $0 == " " } == true ? char : "key\(code)")
             write(["type": "key", "t_ms": stamp(now), "key": k, "mods": mods])
         case .flagsChanged:
             mods = modNames(event.flags)
