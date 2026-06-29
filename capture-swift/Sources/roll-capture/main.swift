@@ -18,7 +18,23 @@ import ApplicationServices
 // Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
 // truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.10"
+let VERSION = "0.0.11"
+
+// macOS injects system "video effects" (Center Stage auto-framing, Portrait
+// blur, Studio Light) into ANY camera feed. They mutate the image mid-take — a
+// faithful capture for editing must not have them. Center Stage we can force
+// off from the app; Portrait/Studio Light are user-only (Control Center), so we
+// just warn if they're active.
+func neutralizeCameraEffects(_ device: AVCaptureDevice) {
+    if AVCaptureDevice.isCenterStageSupported {
+        AVCaptureDevice.centerStageControlMode = .app
+        AVCaptureDevice.isCenterStageEnabled = false
+    }
+    if device.isPortraitEffectActive { err("warning: Portrait effect is ON for \(device.localizedName) — turn it off in Control Center (app can't)") }
+    if #available(macOS 14.0, *), device.isStudioLightActive {
+        err("warning: Studio Light is ON for \(device.localizedName) — turn it off in Control Center (app can't)")
+    }
+}
 
 func argVal(_ name: String) -> String? {
     let a = CommandLine.arguments
@@ -169,6 +185,7 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private(set) var firstWrittenPTS: Double = 0
 
     func arm(device: AVCaptureDevice, outURL: URL) throws {
+        neutralizeCameraEffects(device)   // no mid-take Center Stage zoom
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
         let camIn = try AVCaptureDeviceInput(device: device)
