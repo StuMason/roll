@@ -18,7 +18,7 @@ import ApplicationServices
 // Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
 // truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.9"
+let VERSION = "0.0.10"
 
 func argVal(_ name: String) -> String? {
     let a = CommandLine.arguments
@@ -51,12 +51,20 @@ func micDevices() -> [AVCaptureDevice] {
 func cmt(_ seconds: Double) -> CMTime { CMTime(seconds: seconds, preferredTimescale: 1_000_000) }
 
 // ---- screen (ScreenCaptureKit) ----
+// ScreenCaptureKit is change-driven: a static screen emits almost no frames, so
+// a naive recording would start late (first change) and end at the last change.
+// We make screen.mp4 always span [t0, stop]: the first frame is anchored back to
+// t0, and a keepalive re-emits the last frame through static stretches (and at
+// stop), so the screen stays aligned with the camera/mic rolls.
 @available(macOS 13.0, *)
 final class ScreenRecorder: NSObject, SCStreamOutput {
     private var writer: AVAssetWriter!
     private var input: AVAssetWriterInput!
     private var stream: SCStream!
+    private let q = DispatchQueue(label: "roll.screen")
     private var writeFrom: Double = .infinity
+    private var lastPixelBuffer: CVPixelBuffer?
+    private var lastAppendedPTS: Double = 0
     private(set) var ready = false
     private(set) var delivered = 0
     private(set) var written = 0
@@ -86,13 +94,42 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         config.pixelFormat = kCVPixelFormatType_32BGRA
         let filter = SCContentFilter(display: display, excludingWindows: [])
         stream = SCStream(filter: filter, configuration: config, delegate: nil)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "roll.screen"))
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: q)
         try await stream.startCapture()
     }
 
     func beginWriting(at t0: Double) {
         writer.startSession(atSourceTime: cmt(t0))
         writeFrom = t0
+    }
+
+    // Build a sample buffer from a pixel buffer at an explicit PTS and append it.
+    private func appendImage(_ pb: CVPixelBuffer, at seconds: Double) {
+        guard input.isReadyForMoreMediaData else { return }
+        var fmt: CMFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb, formatDescriptionOut: &fmt)
+        guard let fmt = fmt else { return }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: cmt(seconds), decodeTimeStamp: .invalid)
+        var sb: CMSampleBuffer?
+        CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb,
+            dataReady: true, makeDataReadyCallback: nil, refcon: nil,
+            formatDescription: fmt, sampleTiming: &timing, sampleBufferOut: &sb)
+        if let sb = sb { input.append(sb); written += 1; lastAppendedPTS = seconds }
+    }
+
+    // Re-emit the last frame if the screen has been static (~2fps floor).
+    func keepalive(at t: Double) {
+        q.async {
+            guard t >= self.writeFrom, let pb = self.lastPixelBuffer, t - self.lastAppendedPTS >= 0.4 else { return }
+            self.appendImage(pb, at: t)
+        }
+    }
+
+    // Hold the final frame to the stop instant so duration spans the whole take.
+    func finalize(at t: Double) {
+        q.sync {
+            if let pb = self.lastPixelBuffer, t > self.lastAppendedPTS { self.appendImage(pb, at: t) }
+        }
     }
 
     func stop() async {
@@ -108,11 +145,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         else { return }
         ready = true
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard pts.seconds >= writeFrom else { return }
+        guard pts.seconds >= writeFrom, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        lastPixelBuffer = pb
         delivered += 1
-        if input.isReadyForMoreMediaData {
-            input.append(sampleBuffer); written += 1
-            if firstWrittenPTS == 0 { firstWrittenPTS = pts.seconds }
+        if firstWrittenPTS == 0 {
+            // anchor the first frame at t0 so the screen spans from the very start
+            firstWrittenPTS = writeFrom
+            appendImage(pb, at: writeFrom)
+        } else if input.isReadyForMoreMediaData {
+            input.append(sampleBuffer); written += 1; lastAppendedPTS = pts.seconds
         }
     }
 }
@@ -394,6 +435,28 @@ func listAll() async {
     for (i, d) in micDevices().enumerated() { print("  [\(i)] \(d.localizedName)") }
 }
 
+// One-shot screenshot of a display, downscaled, as a base64 PNG on stdout.
+// Drives the in-app screen thumbnail so you can see which monitor you picked.
+@available(macOS 14.0, *)
+func captureShot(index: Int, maxW: Int) async {
+    do {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard index < content.displays.count else { err("no display \(index)"); exit(1) }
+        let display = content.displays[index]
+        let scale = min(1.0, Double(maxW) / Double(display.width))
+        let cfg = SCStreamConfiguration()
+        cfg.width = max(1, Int(Double(display.width) * scale))
+        cfg.height = max(1, Int(Double(display.height) * scale))
+        cfg.showsCursor = false
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let cg = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+        let rep = NSBitmapImageRep(cgImage: cg)
+        guard let png = rep.representation(using: .png, properties: [:]) else { err("encode failed"); exit(1) }
+        print(png.base64EncodedString())
+        exit(0)
+    } catch { err("shot failed: \(error)"); exit(1) }
+}
+
 @available(macOS 13.0, *)
 func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int, secs: Double, w: Int?, h: Int?) async {
     do {
@@ -462,6 +525,9 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             progress.cancel()
             stdinSrc.cancel()
             telemetry.stop()
+            // hold the screen's final frame out to the stop instant so screen.mp4
+            // spans the whole take even if the screen was static at the end
+            screen.finalize(at: CACurrentMediaTime())
             await screen.stop()
             if let c = cam { await c.stop() }
             if let m = mic { await m.stop() }
@@ -495,6 +561,9 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
         // live progress for the UI — elapsed/frames/clicks every 0.5s
         progress.schedule(deadline: .now() + 0.5, repeating: 0.5)
         progress.setEventHandler {
+            // re-emit the last screen frame through static stretches so the
+            // screen roll never falls behind the camera/mic clock
+            screen.keepalive(at: CACurrentMediaTime())
             let el = Int((CACurrentMediaTime() - t0) * 1000)
             err("progress elapsed=\(el) screen=\(screen.written) camera=\(cam?.written ?? 0) clicks=\(telemetry.clicks) rows=\(telemetry.rows)")
         }
@@ -522,6 +591,7 @@ if args.contains("--help") || args.contains("-h") {
     print("""
     roll-capture \(VERSION)
       --list
+      --shot <i> [--width 480]            one base64 PNG of a display on stdout
       --screen <i> [--cam <i>] [--mic <i>] --out <dir> [--fps 30] [--secs N] [--width W --height H]
     stop: --secs deadline, SIGINT, or a line / EOF on stdin
     """)
@@ -533,6 +603,13 @@ if #available(macOS 13.0, *) {
         let sem = DispatchSemaphore(value: 0)
         Task { await listAll(); sem.signal() }
         sem.wait(); exit(0)
+    }
+    if let shot = argVal("--shot") {
+        if #available(macOS 14.0, *) {
+            let maxW = Int(argVal("--width") ?? "480") ?? 480
+            Task { await captureShot(index: Int(shot) ?? 0, maxW: maxW) }
+            RunLoop.main.run()
+        } else { err("--shot needs macOS 14"); exit(1) }
     }
     if let scr = argVal("--screen"), let outDir = argVal("--out") {
         let fps = Int(argVal("--fps") ?? "30") ?? 30
