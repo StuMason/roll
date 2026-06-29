@@ -122,6 +122,16 @@ export async function highlightDisplay(x: number, y: number, w: number, h: numbe
   await core.invoke("highlight_display", { x, y, w, h });
 }
 
+export async function screenShot(display: number, width = 480): Promise<string | null> {
+  if (!isTauri) return null; // no real screen grab in the browser mock
+  const { core } = await tauri();
+  try {
+    return await core.invoke<string>("screen_shot", { display, width });
+  } catch {
+    return null;
+  }
+}
+
 export async function reveal(dir: string): Promise<void> {
   if (!isTauri) {
     // eslint-disable-next-line no-console

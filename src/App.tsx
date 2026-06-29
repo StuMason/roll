@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Dropdown, { Opt } from "./components/Dropdown";
 import CameraPreview from "./components/CameraPreview";
-import { ENGINE, highlightDisplay, listDevices, onState, reveal, startRecording, stopRecording } from "./api";
+import { ENGINE, highlightDisplay, listDevices, onState, reveal, screenShot, startRecording, stopRecording } from "./api";
 import type { Devices, LiveStats, Pack, RecState, RecordConfig } from "./types";
 
 const FPS = [24, 30, 60];
@@ -22,8 +22,16 @@ export default function App() {
   const [stats, setStats] = useState<LiveStats>({ elapsedMs: 0 });
   const [packs, setPacks] = useState<Pack[]>([]);
   const [showPreview, setShowPreview] = useState(true);
+  const [shot, setShot] = useState<string | null>(null);
 
   const loaded = useRef(false);
+
+  // grab a fresh thumbnail of the picked screen (skipped while a take runs)
+  async function refreshShot(idx: number) {
+    setShot(null);
+    const url = await screenShot(idx);
+    setShot(url);
+  }
 
   async function loadDevices() {
     const d = await listDevices();
@@ -55,6 +63,12 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // refresh the screen thumbnail whenever the picked display changes (idle only)
+  useEffect(() => {
+    if (devices && state === "idle") refreshShot(display);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [display, devices !== null]);
 
   const cfg: RecordConfig = useMemo(
     () => ({ display, camera, mic, fps }),
@@ -103,7 +117,10 @@ export default function App() {
         {showPreview && (
           <section className="previews">
             <CameraPreview cameraIndex={camera} cameraLabel={cameraLabel} recording={recording} />
-            <div className={`screen-card${recording ? " rec" : ""}`}>
+            <div className={`screen-card${recording ? " rec" : ""}${shot ? " has-shot" : ""}`}>
+              {shot ? (
+                <img className="screen-shot" src={shot} alt={`Preview of ${displayLabel || "display"}`} />
+              ) : null}
               <div className="screen-info">
                 <svg viewBox="0 0 48 42" width="40" height="35" aria-hidden>
                   <rect x="3" y="3" width="42" height="28" rx="3" fill="none" stroke="currentColor" strokeWidth="2.2" />

@@ -123,6 +123,10 @@ body {
 }
 .screen-info .screen-name { color: var(--muted); }
 .screen-info .screen-sub { color: var(--muted-2); }
+/* live thumbnail of the picked screen; the icon card sits underneath as fallback */
+.screen-shot { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.screen-card.has-shot .screen-info { display: none; }
+.screen-card.has-shot .cam-badge { background: rgba(0, 0, 0, 0.55); }
 .screen-mock {
   flex: 1; position: relative;
   background:

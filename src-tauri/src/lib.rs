@@ -338,6 +338,29 @@ fn stop_recording(app: AppHandle, state: State<AppState>) -> Result<Pack, String
     Ok(pack)
 }
 
+/// One-shot screenshot of a display as a `data:` PNG URL, for the in-app screen
+/// preview thumbnail. Asks the sidecar (`--shot <i>`) for a downscaled base64 PNG.
+#[tauri::command]
+fn screen_shot(display: u32, width: Option<u32>) -> Result<String, String> {
+    let w = width.unwrap_or(480);
+    let out = Command::new(sidecar_path())
+        .arg("--shot")
+        .arg(display.to_string())
+        .arg("--width")
+        .arg(w.to_string())
+        .output()
+        .map_err(|e| format!("shot: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let b64 = String::from_utf8_lossy(&out.stdout);
+    let b64 = b64.trim();
+    if b64.is_empty() {
+        return Err("empty screenshot".into());
+    }
+    Ok(format!("data:image/png;base64,{b64}"))
+}
+
 #[tauri::command]
 fn reveal(path: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -394,7 +417,8 @@ pub fn run() {
             start_recording,
             stop_recording,
             reveal,
-            highlight_display
+            highlight_display,
+            screen_shot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
