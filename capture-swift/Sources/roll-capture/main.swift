@@ -26,7 +26,7 @@ let VERSION = "0.0.11"
 // off from the app; Portrait/Studio Light are user-only (Control Center), so we
 // just warn if they're active.
 func neutralizeCameraEffects(_ device: AVCaptureDevice) {
-    if AVCaptureDevice.isCenterStageSupported {
+    if device.activeFormat.isCenterStageSupported {
         AVCaptureDevice.centerStageControlMode = .app
         AVCaptureDevice.isCenterStageEnabled = false
     }
