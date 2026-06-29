@@ -109,11 +109,14 @@ fn sidecar_path() -> PathBuf {
     PathBuf::from("roll-capture")
 }
 
+/// Where packs are written. `~/Movies/roll` — persistent and discoverable in
+/// Finder, not buried in app-data or a temp dir that a reboot wipes.
 fn recordings_root(app: &AppHandle) -> PathBuf {
     app.path()
-        .app_data_dir()
+        .video_dir()
+        .or_else(|_| app.path().home_dir())
         .unwrap_or_else(|_| std::env::temp_dir())
-        .join("recordings")
+        .join("roll")
 }
 
 // ---- device list parsing (`roll-capture --list`) ----

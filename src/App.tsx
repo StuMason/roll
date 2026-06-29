@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Dropdown, { Opt } from "./components/Dropdown";
 import CameraPreview from "./components/CameraPreview";
 import { ENGINE, listDevices, onState, reveal, startRecording, stopRecording } from "./api";
@@ -23,20 +23,37 @@ export default function App() {
   const [packs, setPacks] = useState<Pack[]>([]);
   const [showPreview, setShowPreview] = useState(true);
 
-  useEffect(() => {
-    listDevices().then((d) => {
-      setDevices(d);
+  const loaded = useRef(false);
+
+  async function loadDevices() {
+    const d = await listDevices();
+    setDevices(d);
+    if (!loaded.current) {
+      loaded.current = true;
       setDisplay(d.displays[0]?.index ?? 0);
       setCamera(d.cameras[0]?.index ?? null);
       setMic(d.mics[0]?.index ?? null);
-    });
+    } else {
+      // hot-plug refresh: keep current picks, drop any that were unplugged
+      setDisplay((c) => (d.displays.some((x) => x.index === c) ? c : d.displays[0]?.index ?? 0));
+      setCamera((c) => (c === null || d.cameras.some((x) => x.index === c) ? c : null));
+      setMic((c) => (c === null || d.mics.some((x) => x.index === c) ? c : d.mics[0]?.index ?? null));
+    }
+  }
+
+  useEffect(() => {
+    loadDevices();
+    const onFocus = () => loadDevices();
+    window.addEventListener("focus", onFocus);
     const un = onState((e) => {
       setState(e.state);
       setStats(e.stats);
     });
     return () => {
+      window.removeEventListener("focus", onFocus);
       un.then((f) => f());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const cfg: RecordConfig = useMemo(
@@ -77,13 +94,13 @@ export default function App() {
           <section className="previews">
             <CameraPreview cameraIndex={camera} cameraLabel={cameraLabel} recording={recording} />
             <div className={`screen-card${recording ? " rec" : ""}`}>
-              <div className="screen-mock">
-                <span className="screen-grid" />
-                <span className="screen-cursor" />
-              </div>
-              <div className="screen-meta">
+              <div className="screen-info">
+                <svg viewBox="0 0 48 42" width="40" height="35" aria-hidden>
+                  <rect x="3" y="3" width="42" height="28" rx="3" fill="none" stroke="currentColor" strokeWidth="2.2" />
+                  <path d="M16 38h16M24 31v7" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
+                </svg>
                 <span className="screen-name">{displayLabel || "Display"}</span>
-                <span className="screen-sub">screen · captured at native res</span>
+                <span className="screen-sub">captured at native resolution</span>
               </div>
               <span className="cam-badge">SCREEN</span>
             </div>
@@ -93,6 +110,9 @@ export default function App() {
         <section className="controls">
           <div className="row">
             <Dropdown label="Display" value={display} options={displayOpts} onChange={(v) => setDisplay(v ?? 0)} disabled={busy} />
+            <button className="ghost" onClick={loadDevices} disabled={busy} title="Re-scan devices">
+              ↻ Refresh
+            </button>
             <button className="ghost" onClick={() => setShowPreview((s) => !s)}>
               {showPreview ? "Hide preview" : "Show preview"}
             </button>

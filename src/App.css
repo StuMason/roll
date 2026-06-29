@@ -115,6 +115,14 @@ body {
 }
 
 .screen-card { display: flex; flex-direction: column; }
+.screen-info {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 8px;
+  color: var(--muted-2);
+  background: radial-gradient(120% 80% at 50% 0%, #14161e, #07080b);
+}
+.screen-info .screen-name { color: var(--muted); }
+.screen-info .screen-sub { color: var(--muted-2); }
 .screen-mock {
   flex: 1; position: relative;
   background:
