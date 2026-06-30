@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import ScreenCaptureKit
 import CoreMedia
+import CoreImage
 import QuartzCore
 import AppKit
 import ApplicationServices
@@ -37,7 +38,8 @@ let NAMED_KEYS: [Int: String] = [
 // user's Control Center toggle (control mode `.user`, default on = framed face).
 // We only surface the effects we can read but can't change.
 func noteCameraEffects(_ device: AVCaptureDevice) {
-    // respect Control Center rather than forcing the framing either way
+    // Don't impose any framing. Respect the user's Control Center toggle (same as
+    // OBS does) — no forced Center Stage / face tracking either way.
     AVCaptureDevice.centerStageControlMode = .user
     if device.isPortraitEffectActive { err("warning: Portrait effect is ON for \(device.localizedName) — turn it off in Control Center (app can't)") }
     if #available(macOS 14.0, *), device.isStudioLightActive {
@@ -89,13 +91,16 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     private let q = DispatchQueue(label: "roll.screen")
     private var writeFrom: Double = .infinity
     private var lastPixelBuffer: CVPixelBuffer?
-    private var lastAppendedPTS: Double = 0
+    private var fps = 30
+    private var slot = 0                       // next CFR slot index to emit
+    private var slotTimer: DispatchSourceTimer?
     private(set) var ready = false
     private(set) var delivered = 0
     private(set) var written = 0
     private(set) var firstWrittenPTS: Double = 0
 
     func arm(display: SCDisplay, fps: Int, width: Int, height: Int, outURL: URL) async throws {
+        self.fps = fps
         writer = try AVAssetWriter(url: outURL, fileType: .mp4)
         input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -105,6 +110,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                 AVVideoMaxKeyFrameIntervalKey: fps * 2,
                 AVVideoExpectedSourceFrameRateKey: fps,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                // no B-frames → DTS == PTS, strictly monotonic, frame-accurate cutting
+                AVVideoAllowFrameReorderingKey: false,
             ],
         ])
         input.expectsMediaDataInRealTime = true
@@ -126,38 +133,61 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     func beginWriting(at t0: Double) {
         writer.startSession(atSourceTime: cmt(t0))
         writeFrom = t0
+        firstWrittenPTS = t0
+        slot = 0
+        // ScreenCaptureKit is change-driven (VFR). We resample to a strict CFR
+        // grid: a timer emits the latest frame into every 1/fps slot, holding the
+        // last frame through static stretches. Output is constant-rate with
+        // monotonic PTS — what a frame-accurate editor needs.
+        let t = DispatchSource.makeTimerSource(queue: q)
+        let interval = 1.0 / Double(fps)
+        t.schedule(deadline: .now(), repeating: interval)
+        t.setEventHandler { [weak self] in self?.pump(upTo: CACurrentMediaTime()) }
+        t.resume()
+        slotTimer = t
     }
 
-    // Build a sample buffer from a pixel buffer at an explicit PTS and append it.
+    private func slotTime(_ n: Int) -> Double { writeFrom + Double(n) / Double(fps) }
+
+    // Emit the held frame into every CFR slot whose time has arrived (≤ `now`).
+    private func pump(upTo now: Double) {
+        guard let pb = lastPixelBuffer else { return }
+        var emitted = 0
+        while slotTime(slot) <= now, emitted < fps {           // cap catch-up to ~1s/tick
+            guard input.isReadyForMoreMediaData else { break }  // retry this slot next tick
+            appendImage(pb, at: slotTime(slot))
+            slot += 1; emitted += 1
+        }
+    }
+
+    // Build a constant-duration sample buffer at an explicit CFR PTS and append it.
     private func appendImage(_ pb: CVPixelBuffer, at seconds: Double) {
-        guard input.isReadyForMoreMediaData else { return }
         var fmt: CMFormatDescription?
         CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb, formatDescriptionOut: &fmt)
         guard let fmt = fmt else { return }
-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: cmt(seconds), decodeTimeStamp: .invalid)
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: CMTimeScale(fps)),
+            presentationTimeStamp: cmt(seconds), decodeTimeStamp: .invalid)
         var sb: CMSampleBuffer?
         CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb,
             dataReady: true, makeDataReadyCallback: nil, refcon: nil,
             formatDescription: fmt, sampleTiming: &timing, sampleBufferOut: &sb)
-        if let sb = sb { input.append(sb); written += 1; lastAppendedPTS = seconds }
+        if let sb = sb { input.append(sb); written += 1 }
     }
 
-    // Re-emit the last frame if the screen has been static (~2fps floor).
-    func keepalive(at t: Double) {
-        q.async {
-            guard t >= self.writeFrom, let pb = self.lastPixelBuffer, t - self.lastAppendedPTS >= 0.4 else { return }
-            self.appendImage(pb, at: t)
-        }
-    }
-
-    // Hold the final frame to the stop instant so duration spans the whole take.
+    // Fill CFR slots up to the stop instant so duration spans the whole take.
     func finalize(at t: Double) {
         q.sync {
-            if let pb = self.lastPixelBuffer, t > self.lastAppendedPTS { self.appendImage(pb, at: t) }
+            self.slotTimer?.cancel(); self.slotTimer = nil
+            guard let pb = self.lastPixelBuffer else { return }
+            while self.slotTime(self.slot) <= t, self.input.isReadyForMoreMediaData {
+                self.appendImage(pb, at: self.slotTime(self.slot)); self.slot += 1
+            }
         }
     }
 
     func stop() async {
+        slotTimer?.cancel(); slotTimer = nil
         try? await stream.stopCapture()
         input.markAsFinished()
         await writer.finishWriting()
@@ -169,16 +199,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
               let statusRaw = arr.first?[.status] as? Int, statusRaw == SCFrameStatus.complete.rawValue
         else { return }
         ready = true
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard pts.seconds >= writeFrom, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        lastPixelBuffer = pb
-        delivered += 1
-        if firstWrittenPTS == 0 {
-            // anchor the first frame at t0 so the screen spans from the very start
-            firstWrittenPTS = writeFrom
-            appendImage(pb, at: writeFrom)
-        } else if input.isReadyForMoreMediaData {
-            input.append(sampleBuffer); written += 1; lastAppendedPTS = pts.seconds
+        // just hold the latest frame; the CFR timer owns all writing
+        if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            lastPixelBuffer = pb
+            delivered += 1
         }
     }
 }
@@ -192,9 +216,44 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private(set) var ready = false
     private(set) var written = 0
     private(set) var firstWrittenPTS: Double = 0
+    private weak var device: AVCaptureDevice?
+    private var observers: [NSObjectProtocol] = []
+    private var loggedFirstFrame = false
+
+    // Watch the capture session for the failure modes that silently kill a
+    // Continuity Camera mid-take (runtime errors, interruptions, disconnects).
+    // These all land in stderr → roll://log so we can see them in Console / the app.
+    private func installObservers(_ device: AVCaptureDevice) {
+        let nc = NotificationCenter.default
+        func obs(_ name: NSNotification.Name, _ handler: @escaping (Notification) -> Void) {
+            observers.append(nc.addObserver(forName: name, object: nil, queue: nil, using: handler))
+        }
+        obs(.AVCaptureSessionRuntimeError) { n in
+            let e = n.userInfo?[AVCaptureSessionErrorKey] as? NSError
+            err("📷 camera RUNTIME ERROR: \(e?.localizedDescription ?? "?") code=\(e?.code ?? -1)")
+        }
+        // NB: AVCaptureSessionInterruptionReasonKey / InterruptionReason are
+        // iOS-only — unavailable on macOS — so just dump the raw userInfo.
+        obs(.AVCaptureSessionWasInterrupted) { n in
+            err("📷 camera INTERRUPTED: userInfo=\(n.userInfo ?? [:])")
+        }
+        obs(.AVCaptureSessionInterruptionEnded) { _ in
+            err("📷 camera interruption ENDED")
+        }
+        obs(.AVCaptureSessionDidStopRunning) { _ in
+            err("📷 camera session STOPPED running (suspended=\(device.isSuspended) connected=\(device.isConnected))")
+        }
+        obs(.AVCaptureDeviceWasDisconnected) { n in
+            if let d = n.object as? AVCaptureDevice {
+                err("📷 device DISCONNECTED: \(d.localizedName)")
+            }
+        }
+    }
 
     func arm(device: AVCaptureDevice, outURL: URL) throws {
+        self.device = device
         noteCameraEffects(device)   // respect the user's Center Stage setting
+        installObservers(device)
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
         let camIn = try AVCaptureDeviceInput(device: device)
@@ -204,11 +263,17 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         out.setSampleBufferDelegate(self, queue: DispatchQueue(label: "roll.cam"))
         if session.canAddOutput(out) { session.addOutput(out) }
         session.commitConfiguration()
+        let af = device.activeFormat
+        err("📷 armed: device=\(device.localizedName) suspended=\(device.isSuspended) activeFormat=\(af.formatDescription.dimensions.width)x\(af.formatDescription.dimensions.height) centerStageEnabled=\(AVCaptureDevice.isCenterStageEnabled) activeFormatSupportsCenterStage=\(af.isCenterStageSupported)")
 
         writer = try AVAssetWriter(url: outURL, fileType: .mp4)
         input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: 1280, AVVideoHeightKey: 720,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 2_500_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+            ],
         ])
         input.expectsMediaDataInRealTime = true
         writer.add(input)
@@ -225,11 +290,18 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         session.stopRunning()
         input.markAsFinished()
         await writer.finishWriting()
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
         ready = true
+        if !loggedFirstFrame, let px = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            loggedFirstFrame = true
+            let dims = "\(CVPixelBufferGetWidth(px))x\(CVPixelBufferGetHeight(px))"
+            err("📷 first frame delivered: \(dims) active=\(connection.isActive) suspended=\(device?.isSuspended ?? false)")
+        }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         guard pts.seconds >= writeFrom else { return }
         if input.isReadyForMoreMediaData {
@@ -314,8 +386,20 @@ final class Telemetry {
     private(set) var clicks = 0
     private(set) var ok = false
 
-    func start(outURL: URL, t0: Double) {
+    // Captured-display geometry, so every coordinate we emit is in the SAME space
+    // as screen.mp4: display-local, top-left origin, screen PIXELS. AX/CGEvent give
+    // GLOBAL POINTS, so we subtract the display origin and multiply by the
+    // pixels-per-point scale (2 on Retina). Without this, coords on a non-primary
+    // or Retina display don't line up with screen.mp4 at all.
+    private var ox = 0.0, oy = 0.0   // display origin in global points
+    private var sc = 1.0             // screen pixels per point
+    private var pw = 0, ph = 0       // screen.mp4 pixel dimensions
+    private func px(_ gx: Double) -> Int { Int((gx - ox) * sc) }
+    private func py(_ gy: Double) -> Int { Int((gy - oy) * sc) }
+
+    func start(outURL: URL, t0: Double, originXpt: Double, originYpt: Double, scalePx: Double, pixelW: Int, pixelH: Int) {
         self.t0 = t0
+        ox = originXpt; oy = originYpt; sc = scalePx; pw = pixelW; ph = pixelH
         FileManager.default.createFile(atPath: outURL.path, contents: nil)
         file = try? FileHandle(forWritingTo: outURL)
 
@@ -361,7 +445,14 @@ final class Telemetry {
         if let tap = tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let o = focusObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
         flushScroll(at: CACurrentMediaTime())
-        try? file?.synchronize(); try? file?.close()
+        // close on the write queue so it runs AFTER any pending enrichment writes,
+        // and synchronously so the caller knows metadata.jsonl is fully flushed.
+        // (Previously closing here raced async enrichment blocks still writing to
+        // the handle → NSFileHandle exception that crashed the persistent daemon.)
+        q.sync {
+            try? file?.synchronize(); try? file?.close()
+            file = nil
+        }
     }
 
     private func emitAppFocus(_ app: NSRunningApplication?, at t: Double) {
@@ -385,9 +476,14 @@ final class Telemetry {
 
     private func stamp(_ t: Double) -> Int { Int((t - t0) * 1000) }
 
+    // Safe to call from any thread: all file I/O is funnelled onto the serial
+    // write queue, and skipped once the file has been closed (see stop()).
     private func write(_ obj: [String: Any]) {
-        guard let f = file, let d = try? JSONSerialization.data(withJSONObject: obj) else { return }
-        f.write(d); f.write(Data([0x0a])); rows += 1
+        guard let d = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        q.async { [weak self] in
+            guard let self = self, let f = self.file else { return }
+            f.write(d); f.write(Data([0x0a])); self.rows += 1
+        }
     }
 
     private func button(_ type: CGEventType) -> String {
@@ -420,18 +516,20 @@ final class Telemetry {
             let moved = hypot(loc.x - d.x, loc.y - d.y)
             let sx = d.x, sy = d.y, st = d.t, tx = loc.x, ty = loc.y, m = mods
             q.async {
+                // contextAt needs RAW global points (AX hit-test); coords are
+                // written in screen-pixel space via px()/py().
                 let ctx = self.contextAt(sx, sy)
                 var row: [String: Any] = moved > 8
                     ? ["type": "drag", "t_ms": self.stamp(st), "end_ms": self.stamp(now),
-                       "from": [Int(sx), Int(sy)], "to": [Int(tx), Int(ty)], "button": b, "mods": m]
-                    : ["type": "click", "t_ms": self.stamp(st), "x": Int(sx), "y": Int(sy), "button": b, "mods": m]
+                       "from": [self.px(sx), self.py(sy)], "to": [self.px(tx), self.py(ty)], "button": b, "mods": m]
+                    : ["type": "click", "t_ms": self.stamp(st), "x": self.px(sx), "y": self.py(sy), "button": b, "mods": m]
                 row.merge(ctx) { a, _ in a }
                 self.write(row)
             }
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged:
             if now - lastCursor >= 0.1 {
                 lastCursor = now
-                write(["type": "cursor", "t_ms": stamp(now), "x": Int(loc.x), "y": Int(loc.y)])
+                write(["type": "cursor", "t_ms": stamp(now), "x": px(loc.x), "y": py(loc.y)])
             }
         case .scrollWheel:
             // axis1 = vertical, axis2 = horizontal (point deltas)
@@ -439,7 +537,7 @@ final class Telemetry {
             scrollDX += event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
             if now - lastScroll >= 0.1 {
                 lastScroll = now
-                write(["type": "scroll", "t_ms": stamp(now), "x": Int(loc.x), "y": Int(loc.y),
+                write(["type": "scroll", "t_ms": stamp(now), "x": px(loc.x), "y": py(loc.y),
                        "dx": Int(scrollDX), "dy": Int(scrollDY)])
                 scrollDX = 0; scrollDY = 0
             }
@@ -463,12 +561,18 @@ final class Telemetry {
         guard let v = axCopy(el, attr) else { return nil }
         return CFGetTypeID(v) == CFStringGetTypeID() ? ((v as! CFString) as String) : nil
     }
+    // Element frame in screen.mp4 pixel space (display-local, top-left), clipped to
+    // the visible viewport — AX returns the full element frame in global points,
+    // which can extend off-screen (scrollable content) and sit on another display.
     private func axBounds(_ el: AXUIElement) -> [Int]? {
         guard let p = axCopy(el, kAXPositionAttribute), let s = axCopy(el, kAXSizeAttribute) else { return nil }
         var pt = CGPoint.zero, sz = CGSize.zero
         AXValueGetValue(p as! AXValue, .cgPoint, &pt)
         AXValueGetValue(s as! AXValue, .cgSize, &sz)
-        return [Int(pt.x), Int(pt.y), Int(sz.width), Int(sz.height)]
+        let x = (pt.x - ox) * sc, y = (pt.y - oy) * sc
+        let x0 = max(0.0, x), y0 = max(0.0, y)
+        let x1 = min(Double(pw), x + sz.width * sc), y1 = min(Double(ph), y + sz.height * sc)
+        return [Int(x0), Int(y0), Int(max(0, x1 - x0)), Int(max(0, y1 - y0))]
     }
     private func focusedWindow(_ pid: pid_t) -> String? {
         let app = AXUIElementCreateApplication(pid)
@@ -605,7 +709,10 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
         cam?.beginWriting(at: t0)
         mic?.beginWriting(at: t0)
         let telemetry = Telemetry()
-        telemetry.start(outURL: dir.appendingPathComponent("metadata.jsonl"), t0: t0)
+        let scrW = w ?? display.width, scrH = h ?? display.height
+        telemetry.start(outURL: dir.appendingPathComponent("metadata.jsonl"), t0: t0,
+                        originXpt: display.frame.origin.x, originYpt: display.frame.origin.y,
+                        scalePx: Double(scrW) / display.frame.width, pixelW: scrW, pixelH: scrH)
         err("● recording \(w ?? display.width)x\(h ?? display.height)@\(fps)"
             + "\(camIdx != nil ? " + camera" : "")\(micIdx != nil ? " + mic" : "")"
             + "\(telemetry.ok ? " + meta" : "")  (warmed in \(String(format: "%.1f", warmed))s)")
@@ -657,9 +764,7 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
         // live progress for the UI — elapsed/frames/clicks every 0.5s
         progress.schedule(deadline: .now() + 0.5, repeating: 0.5)
         progress.setEventHandler {
-            // re-emit the last screen frame through static stretches so the
-            // screen roll never falls behind the camera/mic clock
-            screen.keepalive(at: CACurrentMediaTime())
+            // screen writing is now driven by the recorder's own CFR timer
             let el = Int((CACurrentMediaTime() - t0) * 1000)
             err("progress elapsed=\(el) screen=\(screen.written) camera=\(cam?.written ?? 0) clicks=\(telemetry.clicks) rows=\(telemetry.rows)")
         }
@@ -682,6 +787,289 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
     } catch { err("capture failed: \(error)"); exit(1) }
 }
 
+// ============================================================================
+// Daemon mode (`--serve`): ONE persistent process owns the camera the whole time
+// — the OBS model. The camera session opens once and stays open, feeding a live
+// preview to stdout continuously; recording just taps the SAME session (so there
+// is never a second client fighting the Continuity Camera, and no re-handshake
+// when you hit record). Screen + mic + telemetry are created per-recording.
+//
+//   stdin commands (one per line):
+//     cam <idx|none>                              select/clear the preview camera
+//     rec <screen> <cam|-> <mic|-> <fps> <dir>    start recording (camera tapped live)
+//     stop                                        finalize the take, keep previewing
+//     quit                                        clean shutdown
+//   stdout: `FRAME <base64 jpeg>` preview frames (nothing else)
+//   stderr: state/log/progress lines (same format the Tauri reader already parses)
+// ============================================================================
+
+let stdoutHandle = FileHandle.standardOutput
+func outLine(_ s: String) { stdoutHandle.write((s + "\n").data(using: .utf8)!) }
+
+// The single, persistent camera session: live preview + optional recording tap.
+final class CameraStation: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    private let session = AVCaptureSession()
+    private let q = DispatchQueue(label: "roll.camstation")
+    private let ci = CIContext(options: [.cacheIntermediates: false])
+    private let rgb = CGColorSpaceCreateDeviceRGB()
+    private var currentInput: AVCaptureDeviceInput?
+    private let output = AVCaptureVideoDataOutput()
+    private(set) var device: AVCaptureDevice?
+
+    // preview throttle
+    private var lastPreview = 0.0
+    private let previewInterval = 1.0 / 12.0
+    private let previewWidth = 480.0
+
+    // recording tap (set between beginRecording/finishRecording)
+    private var writer: AVAssetWriter?
+    private var winput: AVAssetWriterInput?
+    private var recFrom = Double.infinity
+    private(set) var ready = false
+    private(set) var written = 0
+    private(set) var firstWrittenPTS = 0.0
+
+    override init() {
+        super.init()
+        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        output.alwaysDiscardsLateVideoFrames = true
+        output.setSampleBufferDelegate(self, queue: q)
+    }
+
+    // Open (or switch to) a camera and start previewing. Safe to call repeatedly.
+    func open(_ dev: AVCaptureDevice) {
+        noteCameraEffects(dev)
+        session.beginConfiguration()
+        session.sessionPreset = .hd1280x720
+        if let ci = currentInput { session.removeInput(ci); currentInput = nil }
+        if let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) {
+            session.addInput(input); currentInput = input
+        }
+        if session.canAddOutput(output), !session.outputs.contains(output) { session.addOutput(output) }
+        session.commitConfiguration()
+        device = dev
+        ready = false
+        if !session.isRunning { session.startRunning() }
+        err("📷 preview camera: \(dev.localizedName)")
+    }
+
+    func close() {
+        if session.isRunning { session.stopRunning() }
+        if let ci = currentInput { session.beginConfiguration(); session.removeInput(ci); session.commitConfiguration(); currentInput = nil }
+        device = nil; ready = false
+    }
+
+    // Begin tapping the live session into a file at the shared t0.
+    func beginRecording(outURL: URL, at t0: Double, fps: Int) throws {
+        let w = try AVAssetWriter(url: outURL, fileType: .mp4)
+        let inp = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: 1280, AVVideoHeightKey: 720,
+            AVVideoCompressionPropertiesKey: [
+                // a 720p talking head is visually identical at ~2.5 Mbps; the old
+                // uncapped default ran ~9.6 Mbps (≈720 MB / 10 min). 4× smaller.
+                AVVideoAverageBitRateKey: 2_500_000,
+                AVVideoMaxKeyFrameIntervalKey: fps * 2,
+                AVVideoExpectedSourceFrameRateKey: fps,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+            ],
+        ])
+        inp.expectsMediaDataInRealTime = true
+        w.add(inp)
+        w.startWriting()
+        w.startSession(atSourceTime: cmt(t0))
+        written = 0; firstWrittenPTS = 0
+        winput = inp; writer = w; recFrom = t0
+    }
+
+    func finishRecording() async {
+        recFrom = .infinity
+        winput?.markAsFinished()
+        await writer?.finishWriting()
+        writer = nil; winput = nil
+    }
+
+    private func emitPreview(_ pb: CVPixelBuffer) {
+        let img = CIImage(cvPixelBuffer: pb)
+        let scale = previewWidth / max(img.extent.width, 1)
+        let small = img.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let data = ci.jpegRepresentation(of: small, colorSpace: rgb,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.5]) else { return }
+        outLine("FRAME " + data.base64EncodedString())
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        ready = true
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        if let inp = winput, pts >= recFrom, inp.isReadyForMoreMediaData {
+            inp.append(sampleBuffer); written += 1
+            if firstWrittenPTS == 0 { firstWrittenPTS = pts }
+        }
+        let now = CACurrentMediaTime()
+        if now - lastPreview >= previewInterval, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            lastPreview = now
+            emitPreview(pb)
+        }
+    }
+}
+
+@available(macOS 13.0, *)
+final class Daemon {
+    let station = CameraStation()
+    private var screen: ScreenRecorder?
+    private var mic: MicRecorder?
+    private var telemetry: Telemetry?
+    private var dir: URL?
+    private var display: SCDisplay?
+    private var fps = 30
+    private var t0 = 0.0
+    private var progress: DispatchSourceTimer?
+    private(set) var recording = false
+
+    func handle(_ raw: String) async {
+        let parts = raw.split(separator: " ").map(String.init)
+        guard let cmd = parts.first else { return }
+        switch cmd {
+        case "cam":
+            let arg = parts.count > 1 ? parts[1] : "none"
+            if arg == "none" { station.close() }
+            else if let i = Int(arg) {
+                let devs = cameraDevices()
+                if i < devs.count { station.open(devs[i]) } else { err("no camera \(i)") }
+            }
+        case "rec":
+            guard !recording, parts.count >= 6,
+                  let s = Int(parts[1]), let f = Int(parts[4]) else { err("bad rec command"); return }
+            let cam = Int(parts[2]); let micI = Int(parts[3])
+            await startRec(screenIdx: s, camIdx: cam, micIdx: micI, fps: f, outDir: parts[5...].joined(separator: " "))
+        case "stop":
+            await stopRec()
+        case "quit":
+            if recording { await stopRec() }
+            station.close()
+            exit(0)
+        default:
+            err("unknown command: \(cmd)")
+        }
+    }
+
+    private func startRec(screenIdx: Int, camIdx: Int?, micIdx: Int?, fps: Int, outDir: String) async {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard screenIdx < content.displays.count else { err("no display \(screenIdx)"); return }
+            let disp = content.displays[screenIdx]
+            try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+            let d = URL(fileURLWithPath: outDir)
+
+            // ARM the per-take sources (camera is already live in the station)
+            let scr = ScreenRecorder()
+            try await scr.arm(display: disp, fps: fps, width: disp.width, height: disp.height,
+                              outURL: d.appendingPathComponent("screen.mp4"))
+            var m: MicRecorder?
+            if let mi = micIdx {
+                let devs = micDevices()
+                if mi < devs.count { let r = MicRecorder(); try r.arm(device: devs[mi], outURL: d.appendingPathComponent("mic.m4a")); m = r }
+            }
+            // If a camera index was given but isn't the one we're previewing, switch.
+            if let cidx = camIdx { let devs = cameraDevices(); if cidx < devs.count, station.device?.uniqueID != devs[cidx].uniqueID { station.open(devs[cidx]) } }
+
+            // WARM — wait for screen + mic + (already-running) camera to be ready
+            err("warming up (waiting for sources to connect)…")
+            let warmStart = CACurrentMediaTime()
+            while CACurrentMediaTime() - warmStart < 15 {
+                if scr.ready && (m?.ready ?? true) && (camIdx == nil || station.ready) { break }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            let warmed = CACurrentMediaTime() - warmStart
+
+            // GO — one shared t0 across screen + camera tap + mic + telemetry
+            let start = CACurrentMediaTime()
+            scr.beginWriting(at: start)
+            if camIdx != nil { try station.beginRecording(outURL: d.appendingPathComponent("camera.mp4"), at: start, fps: fps) }
+            m?.beginWriting(at: start)
+            let tel = Telemetry()
+            tel.start(outURL: d.appendingPathComponent("metadata.jsonl"), t0: start,
+                      originXpt: disp.frame.origin.x, originYpt: disp.frame.origin.y,
+                      scalePx: Double(disp.width) / disp.frame.width, pixelW: disp.width, pixelH: disp.height)
+
+            screen = scr; mic = m; telemetry = tel; dir = d; display = disp; self.fps = fps; t0 = start; recording = true
+            err("● recording \(disp.width)x\(disp.height)@\(fps)\(camIdx != nil ? " + camera" : "")\(micIdx != nil ? " + mic" : "")\(tel.ok ? " + meta" : "")  (warmed in \(String(format: "%.1f", warmed))s)")
+
+            let p = DispatchSource.makeTimerSource(queue: .main)
+            p.schedule(deadline: .now() + 0.5, repeating: 0.5)
+            p.setEventHandler { [weak self] in
+                guard let self = self, let scr = self.screen else { return }
+                let el = Int((CACurrentMediaTime() - self.t0) * 1000)
+                err("progress elapsed=\(el) screen=\(scr.written) camera=\(self.station.written) clicks=\(self.telemetry?.clicks ?? 0) rows=\(self.telemetry?.rows ?? 0)")
+            }
+            p.resume()
+            progress = p
+        } catch { err("capture failed: \(error)") }
+    }
+
+    private func stopRec() async {
+        guard recording, let scr = screen, let d = dir, let disp = display else { return }
+        recording = false
+        progress?.cancel(); progress = nil
+        telemetry?.stop()
+        let stopT = CACurrentMediaTime()
+        scr.finalize(at: stopT)
+        await scr.stop()
+        await station.finishRecording()   // camera keeps previewing — only the writer closes
+        await mic?.stop()
+
+        let f = disp.frame
+        var manifest: [String: Any] = [
+            "version": VERSION, "fps": fps, "t0": t0, "durationMs": (stopT - t0) * 1000,
+            "display": ["id": disp.displayID, "x": Int(f.origin.x), "y": Int(f.origin.y),
+                        "w": Int(f.size.width), "h": Int(f.size.height)],
+            "screen": ["file": "screen.mp4", "firstPTS": scr.firstWrittenPTS],
+            "metadata": (telemetry?.ok ?? false) ? "metadata.jsonl" : NSNull(),
+        ]
+        if station.written > 0 {
+            manifest["camera"] = ["file": "camera.mp4", "firstPTS": station.firstWrittenPTS]
+            manifest["cameraSyncOffsetMs"] = (station.firstWrittenPTS - scr.firstWrittenPTS) * 1000
+        }
+        if let m = mic, m.written > 0 {
+            manifest["mic"] = ["file": "mic.m4a", "firstPTS": m.firstWrittenPTS]
+            manifest["micSyncOffsetMs"] = (m.firstWrittenPTS - scr.firstWrittenPTS) * 1000
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted]) {
+            try? data.write(to: d.appendingPathComponent("manifest.json"))
+        }
+        err("saved \(d.path)")   // Tauri reads this to build the pack + go idle
+        screen = nil; mic = nil; telemetry = nil; dir = nil; display = nil
+    }
+}
+
+@available(macOS 13.0, *)
+func serve() {
+    let daemon = Daemon()
+    // graceful shutdown so a finalize-in-flight isn't truncated by a signal
+    for sig in [SIGTERM, SIGINT, SIGHUP] {
+        signal(sig, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+        src.setEventHandler { Task { await daemon.handle("quit") } }
+        src.resume()
+        // keep the source alive for the process lifetime
+        signalSources.append(src)
+    }
+    // read stdin commands on a background thread; run each on the main queue
+    Thread.detachNewThread {
+        while let line = readLine(strippingNewline: true) {
+            let l = line.trimmingCharacters(in: .whitespaces)
+            if l.isEmpty { continue }
+            DispatchQueue.main.async { Task { await daemon.handle(l) } }
+        }
+        // stdin closed (parent gone) — shut down cleanly
+        DispatchQueue.main.async { Task { await daemon.handle("quit") } }
+    }
+    err("roll-capture \(VERSION) serving")
+    RunLoop.main.run()
+}
+var signalSources: [DispatchSourceSignal] = []
+
 // ---- entry ----
 if args.contains("--help") || args.contains("-h") {
     print("""
@@ -689,6 +1077,9 @@ if args.contains("--help") || args.contains("-h") {
       --list
       --shot <i> [--width 480]            one base64 PNG of a display on stdout
       --screen <i> [--cam <i>] [--mic <i>] --out <dir> [--fps 30] [--secs N] [--width W --height H]
+      --serve                              persistent daemon: one camera session for
+                                           live preview (FRAME lines on stdout) + recording
+                                           (stdin: cam/rec/stop/quit)
     stop: --secs deadline, SIGINT, or a line / EOF on stdin
     """)
     exit(0)
@@ -699,6 +1090,9 @@ if #available(macOS 13.0, *) {
         let sem = DispatchSemaphore(value: 0)
         Task { await listAll(); sem.signal() }
         sem.wait(); exit(0)
+    }
+    if args.contains("--serve") {
+        serve()   // never returns (runs the main run loop)
     }
     if let shot = argVal("--shot") {
         if #available(macOS 14.0, *) {

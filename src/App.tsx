@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Dropdown, { Opt } from "./components/Dropdown";
 import CameraPreview from "./components/CameraPreview";
 import PackInspector from "./components/PackInspector";
-import { ENGINE, highlightDisplay, listDevices, listPacks, onState, reveal, screenShot, startRecording, stopRecording } from "./api";
+import { ENGINE, highlightDisplay, listDevices, listPacks, onSaved, onState, reveal, screenShot, setPreviewCamera, startRecording, stopRecording } from "./api";
 import type { Devices, LiveStats, Pack, RecState, RecordConfig } from "./types";
 
 const SAVED = "roll.cfg.v1";
@@ -38,6 +38,10 @@ export default function App() {
   const [openPack, setOpenPack] = useState<Pack | null>(null);
 
   const loaded = useRef(false);
+  // the daemon finalizes a take almost instantly; hold the "saving" spinner for a
+  // beat so stopping reads as a real step rather than a jarring snap back to idle
+  const savingAt = useRef(0);
+  const SAVE_MIN_MS = 1000;
 
   // grab a fresh thumbnail of the picked screen (skipped while a take runs)
   async function refreshShot(idx: number) {
@@ -70,15 +74,38 @@ export default function App() {
     const onFocus = () => loadDevices();
     window.addEventListener("focus", onFocus);
     const un = onState((e) => {
+      if (e.state === "saving") savingAt.current = performance.now();
+      // keep "saving" visible for a minimum beat before snapping to idle
+      if (e.state === "idle" && savingAt.current) {
+        const wait = Math.max(0, SAVE_MIN_MS - (performance.now() - savingAt.current));
+        savingAt.current = 0;
+        window.setTimeout(() => { setState("idle"); setStats(e.stats); }, wait);
+        return;
+      }
       setState(e.state);
       setStats(e.stats);
+    });
+    // a finished take: refresh the library from disk (source of truth), falling
+    // back to prepending the emitted pack if the rescan comes back empty
+    const unSaved = onSaved((pack) => {
+      listPacks()
+        .then((all) => setPacks(all.length ? all : (p) => [pack, ...p]))
+        .catch(() => setPacks((p) => [pack, ...p]));
     });
     return () => {
       window.removeEventListener("focus", onFocus);
       un.then((f) => f());
+      unSaved.then((f) => f());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Point the daemon's live preview at the selected camera (idle only — the
+  // dropdowns are disabled mid-take, so this won't fire during a recording).
+  useEffect(() => {
+    if (devices && state === "idle") setPreviewCamera(camera).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [camera, devices !== null]);
 
   // refresh the screen thumbnail whenever the picked display changes (idle only)
   useEffect(() => {
@@ -120,11 +147,8 @@ export default function App() {
     await startRecording(cfg);
   }
   async function stop() {
-    const pack = await stopRecording(cfg);
-    // disk is the source of truth (exact duration, sync, rows); fall back to the
-    // returned pack if the rescan somehow comes back empty
-    const all = await listPacks().catch(() => [] as Pack[]);
-    setPacks(all.length ? all : (p) => [pack, ...p]);
+    // the daemon finalizes and emits the pack via onSaved (wired above)
+    await stopRecording(cfg);
   }
 
   return (

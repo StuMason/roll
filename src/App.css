@@ -97,8 +97,8 @@ body {
   background: #07080b;
 }
 .cam.rec, .screen-card.rec { border-color: var(--rec); }
-.cam video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
-.cam video.hidden { display: none; }
+.cam img { width: 100%; height: 100%; object-fit: cover; }
+.cam img.hidden { display: none; }
 .cam-fallback {
   position: absolute; inset: 0;
   display: flex; flex-direction: column; align-items: center; justify-content: center;

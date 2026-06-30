@@ -84,21 +84,71 @@ struct Pack {
     mic_sync_offset_ms: Option<f64>,
 }
 
-/// An in-flight take: the running sidecar plus what we need to stop it and
-/// build the pack afterwards.
-struct Active {
+/// The persistent `roll-capture --serve` process. It owns the camera the whole
+/// time (live preview + recording tap), so we talk to it over stdin rather than
+/// spawning a fresh sidecar per take.
+struct Daemon {
+    #[allow(dead_code)] // kept alive so the child isn't reaped; dropped on app exit
     child: Child,
-    stdin: Option<ChildStdin>,
-    dir: PathBuf,
-    id: String,
+    stdin: ChildStdin,
+}
+
+/// The in-flight take's bookkeeping (the daemon does the capture; we just track
+/// when it started for the "saving" elapsed readout).
+struct RecInfo {
     started: Instant,
 }
 
 #[derive(Default)]
 struct RecorderState {
-    active: Option<Active>,
+    daemon: Option<Daemon>,
+    rec: Option<RecInfo>,
 }
 struct AppState(Mutex<RecorderState>);
+
+/// Spawn the persistent capture daemon if it isn't already running, wiring its
+/// stdout (preview `FRAME` lines) and stderr (state/log/`saved`) to the UI.
+fn ensure_daemon(app: &AppHandle, g: &mut RecorderState) -> Result<(), String> {
+    // reuse a live daemon; if it died (crash/exit), drop it and respawn
+    if let Some(d) = g.daemon.as_mut() {
+        match d.child.try_wait() {
+            Ok(None) => return Ok(()), // still running
+            _ => {
+                g.daemon = None;
+                g.rec = None;
+            }
+        }
+    }
+    let bin = sidecar_path();
+    let mut child = Command::new(&bin)
+        .arg("--serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
+    let stdin = child.stdin.take().ok_or("daemon: no stdin")?;
+    if let Some(stdout) = child.stdout.take() {
+        let app2 = app.clone();
+        std::thread::spawn(move || frame_loop(app2, stdout));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let app2 = app.clone();
+        std::thread::spawn(move || reader_loop(app2, stderr));
+    }
+    g.daemon = Some(Daemon { child, stdin });
+    Ok(())
+}
+
+/// Forward the daemon's live preview frames to the webview as `roll://frame`
+/// events (each a ready-to-render `data:` JPEG URL).
+fn frame_loop(app: AppHandle, stdout: std::process::ChildStdout) {
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if let Some(b64) = line.strip_prefix("FRAME ") {
+            let _ = app.emit("roll://frame", format!("data:image/jpeg;base64,{b64}"));
+        }
+    }
+}
 
 /// Locate the `roll-capture` binary: next to the app executable when bundled,
 /// otherwise the release build inside the repo (dev).
@@ -169,7 +219,14 @@ fn parse_devices(text: &str) -> Devices {
                             let label = label_s.trim();
                             match section {
                                 "d" => displays.push(parse_display(index, label)),
-                                "c" => cameras.push(Device { index, label: label.to_string(), ..Default::default() }),
+                                // strip the CLI-only diagnostic block ("  (type=… fmts=[…])")
+                                // the engine appends — the dropdown wants a clean device name.
+                                // Split on "  (type=" so a name like "FaceTime HD Camera
+                                // (Built-in)" keeps its own parenthetical.
+                                "c" => {
+                                    let name = label.split("  (type=").next().unwrap_or(label).trim();
+                                    cameras.push(Device { index, label: name.to_string(), ..Default::default() });
+                                }
                                 "m" => mics.push(Device { index, label: label.to_string(), ..Default::default() }),
                                 _ => {}
                             }
@@ -209,6 +266,39 @@ fn parse_progress(rest: &str, warmed_ms: Option<u64>) -> LiveStats {
 
 fn emit_state(app: &AppHandle, state: &str, stats: LiveStats) {
     let _ = app.emit("roll://state", StateEvent { state: state.to_string(), stats });
+    // mirror the take status into the menu-bar item
+    if let Some(tray) = app.tray_by_id("roll-tray") {
+        let title = match state {
+            "warming" => Some("○ warming…"),
+            "recording" => Some("● Rec"),
+            "saving" => Some("saving…"),
+            _ => None,
+        };
+        let _ = tray.set_title(title);
+    }
+}
+
+/// Stop the in-flight take (shared by the command and the menu-bar item): emit
+/// "saving" and tell the daemon to finalize. The pack + idle come back via the
+/// daemon's `saved` line.
+fn do_stop(app: &AppHandle, g: &mut RecorderState) -> Result<(), String> {
+    let rec = match g.rec.take() {
+        Some(r) => r,
+        None => return Ok(()), // not recording — no-op
+    };
+    emit_state(
+        app,
+        "saving",
+        LiveStats {
+            elapsed_ms: rec.started.elapsed().as_millis() as u64,
+            ..Default::default()
+        },
+    );
+    if let Some(d) = g.daemon.as_mut() {
+        d.stdin.write_all(b"stop\n").map_err(|e| e.to_string())?;
+        d.stdin.flush().ok();
+    }
+    Ok(())
 }
 
 fn reader_loop(app: AppHandle, stderr: std::process::ChildStderr) {
@@ -221,10 +311,25 @@ fn reader_loop(app: AppHandle, stderr: std::process::ChildStderr) {
             emit_state(&app, "recording", LiveStats { warmed_ms, ..Default::default() });
         } else if let Some(rest) = line.strip_prefix("progress ") {
             emit_state(&app, "recording", parse_progress(rest, warmed_ms));
+        } else if let Some(dir) = line.strip_prefix("saved ") {
+            // the daemon finished finalizing a take — build the pack and go idle
+            let p = Path::new(dir.trim());
+            let id = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let pack = build_pack(p, &id, 0); // 0 → take durationMs from the manifest
+            let _ = app.emit("roll://saved", &pack);
+            emit_state(&app, "idle", LiveStats::default());
         } else {
             let _ = app.emit("roll://log", line);
         }
     }
+    // stderr closed → the daemon exited (clean quit or crash). Reset state so the
+    // UI never hangs on "saving" and the next action respawns a fresh daemon.
+    if let Some(state) = app.try_state::<AppState>() {
+        let mut g = state.0.lock().unwrap();
+        g.daemon = None;
+        g.rec = None;
+    }
+    emit_state(&app, "idle", LiveStats::default());
 }
 
 /// Last telemetry timestamp — a good proxy for take length when a pack was
@@ -326,12 +431,26 @@ fn list_devices() -> Result<Devices, String> {
     Ok(parse_devices(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Point the live preview at a camera (or `None` to release it). Spawns the
+/// daemon on first use; the preview then streams via `roll://frame`.
+#[tauri::command]
+fn set_preview_camera(app: AppHandle, state: State<AppState>, index: Option<u32>) -> Result<(), String> {
+    let mut g = state.0.lock().unwrap();
+    ensure_daemon(&app, &mut g)?;
+    let arg = index.map(|i| i.to_string()).unwrap_or_else(|| "none".into());
+    let d = g.daemon.as_mut().unwrap();
+    d.stdin.write_all(format!("cam {arg}\n").as_bytes()).map_err(|e| e.to_string())?;
+    d.stdin.flush().ok();
+    Ok(())
+}
+
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<AppState>, config: RecordConfig) -> Result<String, String> {
     let mut g = state.0.lock().unwrap();
-    if g.active.is_some() {
+    if g.rec.is_some() {
         return Err("already recording".into());
     }
+    ensure_daemon(&app, &mut g)?;
 
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -341,61 +460,26 @@ fn start_recording(app: AppHandle, state: State<AppState>, config: RecordConfig)
     let dir = recordings_root(&app).join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let bin = sidecar_path();
-    let mut cmd = Command::new(&bin);
-    cmd.arg("--screen").arg(config.display.to_string());
-    if let Some(c) = config.camera {
-        cmd.arg("--cam").arg(c.to_string());
-    }
-    if let Some(m) = config.mic {
-        cmd.arg("--mic").arg(m.to_string());
-    }
-    cmd.arg("--out").arg(&dir).arg("--fps").arg(config.fps.to_string());
-    cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
-    if let Some(stderr) = child.stderr.take() {
-        let app2 = app.clone();
-        std::thread::spawn(move || reader_loop(app2, stderr));
-    }
-    let stdin = child.stdin.take();
-    g.active = Some(Active {
-        child,
-        stdin,
-        dir,
-        id: id.clone(),
-        started: Instant::now(),
-    });
+    let cam = config.camera.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
+    let mic = config.mic.map(|m| m.to_string()).unwrap_or_else(|| "-".into());
+    // the daemon joins everything after the fps as the dir, so spaces are fine
+    let cmd = format!("rec {} {} {} {} {}\n", config.display, cam, mic, config.fps, dir.display());
+    let d = g.daemon.as_mut().unwrap();
+    d.stdin.write_all(cmd.as_bytes()).map_err(|e| e.to_string())?;
+    d.stdin.flush().ok();
+    g.rec = Some(RecInfo { started: Instant::now() });
     Ok(id)
 }
 
 #[tauri::command]
-fn stop_recording(app: AppHandle, state: State<AppState>) -> Result<Pack, String> {
-    let mut active = {
-        let mut g = state.0.lock().unwrap();
-        g.active.take().ok_or("not recording")?
-    };
-    emit_state(
-        &app,
-        "saving",
-        LiveStats {
-            elapsed_ms: active.started.elapsed().as_millis() as u64,
-            ..Default::default()
-        },
-    );
-    // graceful stop: a line on stdin makes the engine run finish(); dropping the
-    // handle then closes stdin (EOF) as a fallback trigger.
-    if let Some(mut sin) = active.stdin.take() {
-        let _ = sin.write_all(b"stop\n");
-        let _ = sin.flush();
+fn stop_recording(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let mut g = state.0.lock().unwrap();
+    if g.rec.is_none() {
+        return Err("not recording".into());
     }
-    let _ = active.child.wait();
-    let duration_ms = active.started.elapsed().as_millis() as u64;
-    let pack = build_pack(&active.dir, &active.id, duration_ms);
-    emit_state(&app, "idle", LiveStats::default());
-    Ok(pack)
+    // the daemon keeps previewing and emits `saved <dir>` when done, which the
+    // reader thread turns into the pack + idle state.
+    do_stop(&app, &mut g)
 }
 
 /// One-shot screenshot of a display as a `data:` PNG URL, for the in-app screen
@@ -468,14 +552,53 @@ fn highlight_display(app: AppHandle, x: i32, y: i32, w: i32, h: i32) -> Result<(
     Ok(())
 }
 
+/// A menu-bar (status item) with a Stop control, so a take can be stopped without
+/// hunting for the window. Its title shows the live take status (see emit_state).
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let stop_i = MenuItem::with_id(app, "stop", "Stop Recording", true, None::<&str>)?;
+    let show_i = MenuItem::with_id(app, "show", "Show roll", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&stop_i, &show_i])?;
+
+    let mut tray = TrayIconBuilder::with_id("roll-tray")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "stop" => {
+                let state = app.state::<AppState>();
+                let mut g = state.0.lock().unwrap();
+                let _ = do_stop(app, &mut g);
+            }
+            "show" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            _ => {}
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState(Mutex::new(RecorderState::default())))
+        .setup(|app| {
+            build_tray(app.handle())?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_devices,
             list_packs,
             read_pack,
+            set_preview_camera,
             start_recording,
             stop_recording,
             reveal,
@@ -500,6 +623,15 @@ mod tests {
         assert_eq!(d.cameras.len(), 2);
         assert_eq!(d.cameras[1].label, "iPhone");
         assert_eq!(d.mics[0].index, 6);
+    }
+
+    #[test]
+    fn strips_camera_diagnostic_block() {
+        let t = "cameras:\n  [0] HD Pro Webcam C920  (type=External continuity=false fmts=[640x480,1280x720])\n  [1] FaceTime HD Camera (Built-in)  (type=BuiltInWideAngleCamera active=1280x720)\n";
+        let d = parse_devices(t);
+        // CLI diagnostics stripped, but a name's own parenthetical is kept
+        assert_eq!(d.cameras[0].label, "HD Pro Webcam C920");
+        assert_eq!(d.cameras[1].label, "FaceTime HD Camera (Built-in)");
     }
 
     #[test]

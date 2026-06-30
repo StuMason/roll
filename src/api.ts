@@ -21,6 +21,7 @@ async function tauri() {
 type Listener<T> = (payload: T) => void;
 const stateListeners = new Set<Listener<StateEvent>>();
 const logListeners = new Set<Listener<string>>();
+const savedListeners = new Set<Listener<Pack>>();
 
 const MOCK_DEVICES: Devices = {
   displays: [
@@ -92,7 +93,7 @@ function mockBeginTake(cfg: RecordConfig) {
   }, warm);
 }
 
-function mockEndTake(cfg: RecordConfig): Pack {
+function mockEndTake(cfg: RecordConfig): void {
   if (mockTimer) clearInterval(mockTimer);
   mockTimer = null;
   emitState({ state: "saving", stats: { elapsedMs: performance.now() - mockStart } });
@@ -101,8 +102,7 @@ function mockEndTake(cfg: RecordConfig): Pack {
   if (cfg.camera !== null) sources.push("camera.mp4");
   if (cfg.mic !== null) sources.push("mic.m4a");
   sources.push("metadata.jsonl");
-  setTimeout(() => emitState({ state: "idle", stats: { elapsedMs: 0 } }), 400);
-  return {
+  const pack: Pack = {
     id: `rec-${Date.now()}`,
     dir: `~/Library/Application Support/dev.stumason.roll/recordings/rec-${Date.now()}`,
     durationMs,
@@ -111,6 +111,10 @@ function mockEndTake(cfg: RecordConfig): Pack {
     cameraSyncOffsetMs: cfg.camera !== null ? -13 : undefined,
     micSyncOffsetMs: cfg.mic !== null ? -11 : undefined,
   };
+  setTimeout(() => {
+    savedListeners.forEach((l) => l(pack));
+    emitState({ state: "idle", stats: { elapsedMs: 0 } });
+  }, 400);
 }
 
 // ---------------------------------------------------------------- public api
@@ -146,10 +150,18 @@ export async function startRecording(cfg: RecordConfig): Promise<void> {
   await core.invoke("start_recording", { config: cfg });
 }
 
-export async function stopRecording(cfg: RecordConfig): Promise<Pack> {
+export async function stopRecording(cfg: RecordConfig): Promise<void> {
   if (!isTauri) return mockEndTake(cfg);
   const { core } = await tauri();
-  return core.invoke<Pack>("stop_recording");
+  // fire-and-forget: the finished pack arrives via onSaved, idle via onState
+  await core.invoke("stop_recording");
+}
+
+// Point the live preview (and the next take) at a camera, or null to release it.
+export async function setPreviewCamera(index: number | null): Promise<void> {
+  if (!isTauri) return; // browser mock has no real camera feed
+  const { core } = await tauri();
+  await core.invoke("set_preview_camera", { index });
 }
 
 export async function highlightDisplay(x: number, y: number, w: number, h: number): Promise<void> {
@@ -199,5 +211,24 @@ export async function onLog(cb: Listener<string>): Promise<() => void> {
   }
   const { event } = await tauri();
   const un = await event.listen<string>("roll://log", (e) => cb(e.payload));
+  return un;
+}
+
+// Live camera preview frames (ready-to-render `data:` JPEG URLs) from the daemon.
+export async function onFrame(cb: Listener<string>): Promise<() => void> {
+  if (!isTauri) return () => {}; // no live feed in the browser mock
+  const { event } = await tauri();
+  const un = await event.listen<string>("roll://frame", (e) => cb(e.payload));
+  return un;
+}
+
+// A finished pack, emitted when the daemon finalizes a take.
+export async function onSaved(cb: Listener<Pack>): Promise<() => void> {
+  if (!isTauri) {
+    savedListeners.add(cb);
+    return () => savedListeners.delete(cb);
+  }
+  const { event } = await tauri();
+  const un = await event.listen<Pack>("roll://saved", (e) => cb(e.payload));
   return un;
 }
