@@ -161,7 +161,8 @@ fn sidecar_path() -> PathBuf {
             }
         }
     }
-    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../capture-swift/.build/release/roll-capture");
+    let dev =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../capture-swift/.build/release/roll-capture");
     if dev.exists() {
         return dev;
     }
@@ -181,7 +182,10 @@ fn recordings_root(app: &AppHandle) -> PathBuf {
 // ---- device list parsing (`roll-capture --list`) ----
 /// Parse a display line's "id=.. x=0 y=0 w=2560 h=1440" tail into a Device.
 fn parse_display(index: u32, tail: &str) -> Device {
-    let mut dev = Device { index, ..Default::default() };
+    let mut dev = Device {
+        index,
+        ..Default::default()
+    };
     for kv in tail.split_whitespace() {
         if let Some((k, v)) = kv.split_once('=') {
             let n = v.parse::<i64>().ok();
@@ -224,10 +228,19 @@ fn parse_devices(text: &str) -> Devices {
                                 // Split on "  (type=" so a name like "FaceTime HD Camera
                                 // (Built-in)" keeps its own parenthetical.
                                 "c" => {
-                                    let name = label.split("  (type=").next().unwrap_or(label).trim();
-                                    cameras.push(Device { index, label: name.to_string(), ..Default::default() });
+                                    let name =
+                                        label.split("  (type=").next().unwrap_or(label).trim();
+                                    cameras.push(Device {
+                                        index,
+                                        label: name.to_string(),
+                                        ..Default::default()
+                                    });
                                 }
-                                "m" => mics.push(Device { index, label: label.to_string(), ..Default::default() }),
+                                "m" => mics.push(Device {
+                                    index,
+                                    label: label.to_string(),
+                                    ..Default::default()
+                                }),
                                 _ => {}
                             }
                         }
@@ -236,7 +249,11 @@ fn parse_devices(text: &str) -> Devices {
             }
         }
     }
-    Devices { displays, cameras, mics }
+    Devices {
+        displays,
+        cameras,
+        mics,
+    }
 }
 
 // ---- stderr stream parsing (drives the live UI) ----
@@ -244,11 +261,18 @@ fn parse_warmed(line: &str) -> Option<u64> {
     let i = line.find("warmed in ")? + "warmed in ".len();
     let rest = &line[i..];
     let end = rest.find('s')?;
-    rest[..end].trim().parse::<f64>().ok().map(|s| (s * 1000.0) as u64)
+    rest[..end]
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|s| (s * 1000.0) as u64)
 }
 
 fn parse_progress(rest: &str, warmed_ms: Option<u64>) -> LiveStats {
-    let mut s = LiveStats { warmed_ms, ..Default::default() };
+    let mut s = LiveStats {
+        warmed_ms,
+        ..Default::default()
+    };
     for kv in rest.split_whitespace() {
         if let Some((k, v)) = kv.split_once('=') {
             match k {
@@ -265,7 +289,13 @@ fn parse_progress(rest: &str, warmed_ms: Option<u64>) -> LiveStats {
 }
 
 fn emit_state(app: &AppHandle, state: &str, stats: LiveStats) {
-    let _ = app.emit("roll://state", StateEvent { state: state.to_string(), stats });
+    let _ = app.emit(
+        "roll://state",
+        StateEvent {
+            state: state.to_string(),
+            stats,
+        },
+    );
     // mirror the take status into the menu-bar item
     if let Some(tray) = app.tray_by_id("roll-tray") {
         let title = match state {
@@ -308,13 +338,23 @@ fn reader_loop(app: AppHandle, stderr: std::process::ChildStderr) {
             emit_state(&app, "warming", LiveStats::default());
         } else if line.starts_with("● recording") {
             warmed_ms = parse_warmed(&line);
-            emit_state(&app, "recording", LiveStats { warmed_ms, ..Default::default() });
+            emit_state(
+                &app,
+                "recording",
+                LiveStats {
+                    warmed_ms,
+                    ..Default::default()
+                },
+            );
         } else if let Some(rest) = line.strip_prefix("progress ") {
             emit_state(&app, "recording", parse_progress(rest, warmed_ms));
         } else if let Some(dir) = line.strip_prefix("saved ") {
             // the daemon finished finalizing a take — build the pack and go idle
             let p = Path::new(dir.trim());
-            let id = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let id = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let pack = build_pack(p, &id, 0); // 0 → take durationMs from the manifest
             let _ = app.emit("roll://saved", &pack);
             emit_state(&app, "idle", LiveStats::default());
@@ -358,7 +398,10 @@ fn build_pack(dir: &Path, id: &str, duration_ms: u64) -> Pack {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
             camera_sync_offset_ms = v.get("cameraSyncOffsetMs").and_then(|x| x.as_f64());
             mic_sync_offset_ms = v.get("micSyncOffsetMs").and_then(|x| x.as_f64());
-            manifest_dur = v.get("durationMs").and_then(|x| x.as_f64()).map(|d| d as u64);
+            manifest_dur = v
+                .get("durationMs")
+                .and_then(|x| x.as_f64())
+                .map(|d| d as u64);
         }
     }
     // live recordings pass a real duration; for listed past packs (duration_ms==0)
@@ -395,7 +438,11 @@ fn read_pack(dir: String) -> Result<PackDetail, String> {
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or(serde_json::Value::Null);
     let events = std::fs::read_to_string(p.join("metadata.jsonl"))
-        .map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect()
+        })
         .unwrap_or_default();
     Ok(PackDetail { manifest, events })
 }
@@ -434,18 +481,30 @@ fn list_devices() -> Result<Devices, String> {
 /// Point the live preview at a camera (or `None` to release it). Spawns the
 /// daemon on first use; the preview then streams via `roll://frame`.
 #[tauri::command]
-fn set_preview_camera(app: AppHandle, state: State<AppState>, index: Option<u32>) -> Result<(), String> {
+fn set_preview_camera(
+    app: AppHandle,
+    state: State<AppState>,
+    index: Option<u32>,
+) -> Result<(), String> {
     let mut g = state.0.lock().unwrap();
     ensure_daemon(&app, &mut g)?;
-    let arg = index.map(|i| i.to_string()).unwrap_or_else(|| "none".into());
+    let arg = index
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "none".into());
     let d = g.daemon.as_mut().unwrap();
-    d.stdin.write_all(format!("cam {arg}\n").as_bytes()).map_err(|e| e.to_string())?;
+    d.stdin
+        .write_all(format!("cam {arg}\n").as_bytes())
+        .map_err(|e| e.to_string())?;
     d.stdin.flush().ok();
     Ok(())
 }
 
 #[tauri::command]
-fn start_recording(app: AppHandle, state: State<AppState>, config: RecordConfig) -> Result<String, String> {
+fn start_recording(
+    app: AppHandle,
+    state: State<AppState>,
+    config: RecordConfig,
+) -> Result<String, String> {
     let mut g = state.0.lock().unwrap();
     if g.rec.is_some() {
         return Err("already recording".into());
@@ -460,14 +519,31 @@ fn start_recording(app: AppHandle, state: State<AppState>, config: RecordConfig)
     let dir = recordings_root(&app).join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let cam = config.camera.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
-    let mic = config.mic.map(|m| m.to_string()).unwrap_or_else(|| "-".into());
+    let cam = config
+        .camera
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "-".into());
+    let mic = config
+        .mic
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "-".into());
     // the daemon joins everything after the fps as the dir, so spaces are fine
-    let cmd = format!("rec {} {} {} {} {}\n", config.display, cam, mic, config.fps, dir.display());
+    let cmd = format!(
+        "rec {} {} {} {} {}\n",
+        config.display,
+        cam,
+        mic,
+        config.fps,
+        dir.display()
+    );
     let d = g.daemon.as_mut().unwrap();
-    d.stdin.write_all(cmd.as_bytes()).map_err(|e| e.to_string())?;
+    d.stdin
+        .write_all(cmd.as_bytes())
+        .map_err(|e| e.to_string())?;
     d.stdin.flush().ok();
-    g.rec = Some(RecInfo { started: Instant::now() });
+    g.rec = Some(RecInfo {
+        started: Instant::now(),
+    });
     Ok(id)
 }
 
@@ -640,7 +716,10 @@ mod tests {
             parse_warmed("● recording 2560x1440@30 + camera + mic + meta  (warmed in 2.8s)"),
             Some(2800)
         );
-        let s = parse_progress("elapsed=1234 screen=42 camera=48 clicks=3 rows=120", Some(2800));
+        let s = parse_progress(
+            "elapsed=1234 screen=42 camera=48 clicks=3 rows=120",
+            Some(2800),
+        );
         assert_eq!(s.elapsed_ms, 1234);
         assert_eq!(s.screen_frames, Some(42));
         assert_eq!(s.clicks, Some(3));

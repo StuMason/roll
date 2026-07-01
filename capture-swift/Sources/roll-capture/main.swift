@@ -6,6 +6,7 @@ import CoreImage
 import QuartzCore
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox   // IsSecureEventInputEnabled (skip capture in password fields)
 
 // roll-capture — native macOS capture helper for the roll pack.
 //
@@ -89,6 +90,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     private var input: AVAssetWriterInput!
     private var stream: SCStream!
     private let q = DispatchQueue(label: "roll.screen")
+    private let ci = CIContext(options: [.cacheIntermediates: false])
     private var writeFrom: Double = .infinity
     private var lastPixelBuffer: CVPixelBuffer?
     private var fps = 30
@@ -99,7 +101,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     private(set) var written = 0
     private(set) var firstWrittenPTS: Double = 0
 
-    func arm(display: SCDisplay, fps: Int, width: Int, height: Int, outURL: URL) async throws {
+    // #7 system audio — captured on the SAME SCStream (same clock), written to its
+    // own AAC track so the mic stays clean and crunch can spot app/video audio.
+    private var audioWriter: AVAssetWriter?
+    private var audioInput: AVAssetWriterInput?
+    private var audioFrom: Double = .infinity
+    private(set) var audioWritten = 0
+    private(set) var audioFirstPTS: Double = 0
+
+    func arm(display: SCDisplay, fps: Int, width: Int, height: Int, outURL: URL, sysAudioURL: URL?) async throws {
         self.fps = fps
         writer = try AVAssetWriter(url: outURL, fileType: .mp4)
         input = AVAssetWriterInput(mediaType: .video, outputSettings: [
@@ -124,9 +134,26 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         config.queueDepth = 8
         config.showsCursor = true
         config.pixelFormat = kCVPixelFormatType_32BGRA
+        if sysAudioURL != nil {
+            config.capturesAudio = true
+            config.sampleRate = 48000
+            config.channelCount = 2
+        }
         let filter = SCContentFilter(display: display, excludingWindows: [])
         stream = SCStream(filter: filter, configuration: config, delegate: nil)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: q)
+
+        if let au = sysAudioURL {
+            let aw = try AVAssetWriter(url: au, fileType: .m4a)
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: 2, AVSampleRateKey: 48000, AVEncoderBitRateKey: 128_000,
+            ])
+            ai.expectsMediaDataInRealTime = true
+            aw.add(ai); aw.startWriting()
+            audioWriter = aw; audioInput = ai
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: q)
+        }
         try await stream.startCapture()
     }
 
@@ -135,6 +162,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         writeFrom = t0
         firstWrittenPTS = t0
         slot = 0
+        if let aw = audioWriter { aw.startSession(atSourceTime: cmt(t0)); audioFrom = t0 }
         // ScreenCaptureKit is change-driven (VFR). We resample to a strict CFR
         // grid: a timer emits the latest frame into every 1/fps slot, holding the
         // last frame through static stretches. Output is constant-rate with
@@ -191,9 +219,30 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         try? await stream.stopCapture()
         input.markAsFinished()
         await writer.finishWriting()
+        if let aw = audioWriter { audioInput?.markAsFinished(); await aw.finishWriting() }
+    }
+
+    // #5 pristine full-res PNG of the current frame (clean OCR input, no H.264
+    // motion blur / server-side decode). Runs on the capture queue.
+    func snapshotPNG(to url: URL) {
+        q.async {
+            guard let pb = self.lastPixelBuffer else { return }
+            let img = CIImage(cvPixelBuffer: pb)
+            guard let data = self.ci.pngRepresentation(of: img, format: .RGBA8,
+                colorSpace: CGColorSpaceCreateDeviceRGB()) else { return }
+            try? data.write(to: url)
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        if type == .audio {
+            guard let ai = audioInput, CMSampleBufferDataIsReady(sampleBuffer),
+                  CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds >= audioFrom,
+                  ai.isReadyForMoreMediaData else { return }
+            ai.append(sampleBuffer); audioWritten += 1
+            if audioFirstPTS == 0 { audioFirstPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds }
+            return
+        }
         guard type == .screen, CMSampleBufferDataIsReady(sampleBuffer),
               let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let statusRaw = arr.first?[.status] as? Int, statusRaw == SCFrameStatus.complete.rawValue
@@ -386,6 +435,22 @@ final class Telemetry {
     private(set) var clicks = 0
     private(set) var ok = false
 
+    // #3 typed-text: accumulate printable keystrokes into words, flushed as a
+    // `text` event on Enter/Tab, focus change, or stop. Skipped entirely while
+    // macOS secure input is active (password/secure fields).
+    private var typed = ""
+    private var typedStart = 0.0
+    private var lastFocusApp = "", lastFocusWin = ""
+
+    // #4 clipboard: poll the pasteboard change counter; emit copied text
+    // (size-capped, skipping concealed/secure payloads).
+    private var pbTimer: DispatchSourceTimer?
+    private var pbCount = 0
+
+    // #5 keyframes: the orchestrator wires this to snapshot screen.mp4's current
+    // frame to a PNG at click / app-switch moments (pristine OCR input).
+    var keyframe: ((_ tMs: Int) -> Void)?
+
     // Captured-display geometry, so every coordinate we emit is in the SAME space
     // as screen.mp4: display-local, top-left origin, screen PIXELS. AX/CGEvent give
     // GLOBAL POINTS, so we subtract the display origin and multiply by the
@@ -402,6 +467,9 @@ final class Telemetry {
         ox = originXpt; oy = originYpt; sc = scalePx; pw = pixelW; ph = pixelH
         FileManager.default.createFile(atPath: outURL.path, contents: nil)
         file = try? FileHandle(forWritingTo: outURL)
+
+        pbCount = NSPasteboard.general.changeCount   // ignore whatever's already on the clipboard
+        startClipboardPoll()
 
         // baseline foreground app at t0, then a row on every app switch — gives a
         // continuous app/window context timeline, not just context at click time
@@ -444,7 +512,9 @@ final class Telemetry {
     func stop() {
         if let tap = tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let o = focusObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
+        pbTimer?.cancel(); pbTimer = nil
         flushScroll(at: CACurrentMediaTime())
+        flushTyped(at: CACurrentMediaTime())
         // close on the write queue so it runs AFTER any pending enrichment writes,
         // and synchronously so the caller knows metadata.jsonl is fully flushed.
         // (Previously closing here raced async enrichment blocks still writing to
@@ -457,11 +527,15 @@ final class Telemetry {
 
     private func emitAppFocus(_ app: NSRunningApplication?, at t: Double) {
         guard let app = app, let name = app.localizedName, name != lastApp else { return }
+        flushTyped(at: t)                 // text belongs to the app it was typed in
         lastApp = name
         let pid = app.processIdentifier, ts = stamp(t)
+        keyframe?(ts)                     // #5 snapshot on app switch
         q.async {
+            let w = self.focusedWindow(pid)
+            self.lastFocusApp = name; self.lastFocusWin = w ?? ""
             var row: [String: Any] = ["type": "app_focus", "t_ms": ts, "app": name]
-            if let w = self.focusedWindow(pid) { row["window"] = w }
+            if let w = w { row["window"] = w }
             self.write(row)
         }
     }
@@ -515,6 +589,7 @@ final class Telemetry {
             clicks += 1
             let moved = hypot(loc.x - d.x, loc.y - d.y)
             let sx = d.x, sy = d.y, st = d.t, tx = loc.x, ty = loc.y, m = mods
+            if moved <= 8 { keyframe?(stamp(st)) }   // #5 pristine snapshot on click
             q.async {
                 // contextAt needs RAW global points (AX hit-test); coords are
                 // written in screen-pixel space via px()/py().
@@ -543,14 +618,65 @@ final class Telemetry {
             }
         case .keyDown:
             let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+            let f = event.flags
+            let cmd = f.contains(.maskCommand), ctrl = f.contains(.maskControl), alt = f.contains(.maskAlternate)
+            // #2 marker: ⌃⌥⌘M drops a human "good bit" marker (not logged as a key)
+            if ctrl && alt && cmd && code == 46 {
+                flushTyped(at: now)
+                write(["type": "marker", "t_ms": stamp(now)])
+                break
+            }
+            // #3 typed-text: NEVER capture while macOS secure input is on (passwords)
+            if IsSecureEventInputEnabled() { flushTyped(at: now); break }
             let char = NSEvent(cgEvent: event)?.charactersIgnoringModifiers ?? ""
-            // prefer a friendly name for non-printable keys; fall back to the char
-            let k = NAMED_KEYS[code] ?? (char.first.map { $0.isLetter || $0.isNumber || $0.isPunctuation || $0.isSymbol || $0 == " " } == true ? char : "key\(code)")
-            write(["type": "key", "t_ms": stamp(now), "key": k, "mods": mods])
+            let printable = char.count == 1 && (char.first.map { $0.isLetter || $0.isNumber || $0.isPunctuation || $0.isSymbol || $0 == " " } ?? false)
+            if printable && !cmd && !ctrl && !alt {
+                // plain typing accumulates into a text run
+                if typed.isEmpty { typedStart = now }
+                typed.append(char)
+                if typed.count >= 500 { flushTyped(at: now) }
+            } else if code == 51, !typed.isEmpty {   // backspace edits the run in place
+                typed.removeLast()
+            } else {
+                // shortcut / special key: flush the run, then log the key
+                flushTyped(at: now)
+                let k = NAMED_KEYS[code] ?? (printable ? char : "key\(code)")
+                write(["type": "key", "t_ms": stamp(now), "key": k, "mods": mods])
+            }
         case .flagsChanged:
             mods = modNames(event.flags)
         default: break
         }
+    }
+
+    // #3 emit the accumulated keystrokes as one `text` event, tagged with the app
+    // it was typed in. Cleared after flush.
+    private func flushTyped(at t: Double) {
+        guard !typed.isEmpty else { return }
+        let text = typed; typed = ""
+        var row: [String: Any] = ["type": "text", "t_ms": stamp(typedStart), "end_ms": stamp(t), "text": text]
+        if !lastFocusApp.isEmpty { row["app"] = lastFocusApp }
+        if !lastFocusWin.isEmpty { row["window"] = lastFocusWin }
+        write(row)
+    }
+
+    // #4 poll the pasteboard; emit copied text (capped), skipping concealed/secure.
+    private func startClipboardPoll() {
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        t.setEventHandler { [weak self] in self?.pollClipboard() }
+        t.resume()
+        pbTimer = t
+    }
+    private func pollClipboard() {
+        let pb = NSPasteboard.general
+        guard pb.changeCount != pbCount else { return }
+        pbCount = pb.changeCount
+        if IsSecureEventInputEnabled() { return }
+        let types = (pb.types ?? []).map { $0.rawValue }
+        if types.contains("org.nspasteboard.ConcealedType") || types.contains("org.nspasteboard.TransientType") { return }
+        guard let s = pb.string(forType: .string), !s.isEmpty else { return }
+        write(["type": "clipboard", "t_ms": stamp(CACurrentMediaTime()), "chars": s.count, "text": String(s.prefix(2000))])
     }
 
     private func axCopy(_ el: AXUIElement, _ attr: String) -> CFTypeRef? {
@@ -668,7 +794,8 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
         // ---- phase 1: ARM all sources (phone connects here) ----
         let screen = ScreenRecorder()
         try await screen.arm(display: display, fps: fps, width: w ?? display.width, height: h ?? display.height,
-                             outURL: dir.appendingPathComponent("screen.mp4"))
+                             outURL: dir.appendingPathComponent("screen.mp4"),
+                             sysAudioURL: dir.appendingPathComponent("sysaudio.m4a"))
 
         var cam: CameraRecorder?
         if let ci = camIdx {
@@ -710,6 +837,9 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
         mic?.beginWriting(at: t0)
         let telemetry = Telemetry()
         let scrW = w ?? display.width, scrH = h ?? display.height
+        let kfDir = dir.appendingPathComponent("keyframes")
+        try? FileManager.default.createDirectory(at: kfDir, withIntermediateDirectories: true)
+        telemetry.keyframe = { [weak screen] tMs in screen?.snapshotPNG(to: kfDir.appendingPathComponent("\(tMs).png")) }
         telemetry.start(outURL: dir.appendingPathComponent("metadata.jsonl"), t0: t0,
                         originXpt: display.frame.origin.x, originYpt: display.frame.origin.y,
                         scalePx: Double(scrW) / display.frame.width, pixelW: scrW, pixelH: scrH)
@@ -753,6 +883,10 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
             if let m = mic {
                 manifest["mic"] = ["file": "mic.m4a", "firstPTS": m.firstWrittenPTS]
                 manifest["micSyncOffsetMs"] = (m.firstWrittenPTS - screen.firstWrittenPTS) * 1000
+            }
+            if screen.audioWritten > 0 {
+                manifest["sysaudio"] = ["file": "sysaudio.m4a", "firstPTS": screen.audioFirstPTS]
+                manifest["sysAudioSyncOffsetMs"] = (screen.audioFirstPTS - screen.firstWrittenPTS) * 1000
             }
             if let data = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted]) {
                 try? data.write(to: dir.appendingPathComponent("manifest.json"))
@@ -965,7 +1099,8 @@ final class Daemon {
             // ARM the per-take sources (camera is already live in the station)
             let scr = ScreenRecorder()
             try await scr.arm(display: disp, fps: fps, width: disp.width, height: disp.height,
-                              outURL: d.appendingPathComponent("screen.mp4"))
+                              outURL: d.appendingPathComponent("screen.mp4"),
+                              sysAudioURL: d.appendingPathComponent("sysaudio.m4a"))
             var m: MicRecorder?
             if let mi = micIdx {
                 let devs = micDevices()
@@ -989,6 +1124,9 @@ final class Daemon {
             if camIdx != nil { try station.beginRecording(outURL: d.appendingPathComponent("camera.mp4"), at: start, fps: fps) }
             m?.beginWriting(at: start)
             let tel = Telemetry()
+            let kfDir = d.appendingPathComponent("keyframes")
+            try? FileManager.default.createDirectory(at: kfDir, withIntermediateDirectories: true)
+            tel.keyframe = { [weak scr] tMs in scr?.snapshotPNG(to: kfDir.appendingPathComponent("\(tMs).png")) }
             tel.start(outURL: d.appendingPathComponent("metadata.jsonl"), t0: start,
                       originXpt: disp.frame.origin.x, originYpt: disp.frame.origin.y,
                       scalePx: Double(disp.width) / disp.frame.width, pixelW: disp.width, pixelH: disp.height)
@@ -1034,6 +1172,10 @@ final class Daemon {
         if let m = mic, m.written > 0 {
             manifest["mic"] = ["file": "mic.m4a", "firstPTS": m.firstWrittenPTS]
             manifest["micSyncOffsetMs"] = (m.firstWrittenPTS - scr.firstWrittenPTS) * 1000
+        }
+        if scr.audioWritten > 0 {
+            manifest["sysaudio"] = ["file": "sysaudio.m4a", "firstPTS": scr.audioFirstPTS]
+            manifest["sysAudioSyncOffsetMs"] = (scr.audioFirstPTS - scr.firstWrittenPTS) * 1000
         }
         if let data = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted]) {
             try? data.write(to: d.appendingPathComponent("manifest.json"))
