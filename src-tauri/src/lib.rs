@@ -547,7 +547,10 @@ fn start_recording(
     // Human-readable, local wall-clock name. ISO order == lexical order, so the
     // library's lexical sort stays chronological. Seconds make it unique; the
     // guard below covers the (basically impossible) same-second collision.
-    let base = format!("rollpack-{}", chrono::Local::now().format("%Y-%m-%d-%H-%M-%S"));
+    let base = format!(
+        "rollpack-{}",
+        chrono::Local::now().format("%Y-%m-%d-%H-%M-%S")
+    );
     let root = recordings_root(&app);
     let mut id = base.clone();
     let mut n = 2;
