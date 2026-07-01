@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -469,11 +469,13 @@ fn list_packs(app: AppHandle) -> Result<Vec<Pack>, String> {
     for entry in entries.flatten() {
         let dir = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if dir.is_dir() && name.starts_with("rec-") && dir.join("manifest.json").exists() {
+        let is_pack = name.starts_with("rollpack-") || name.starts_with("rec-"); // rec- = legacy
+        if dir.is_dir() && is_pack && dir.join("manifest.json").exists() {
             packs.push(build_pack(&dir, &name, 0));
         }
     }
-    // rec-<epoch_ms>, so lexical sort on id is chronological; newest first
+    // Names are date-ordered (rollpack-<ISO>) or epoch-ordered (legacy rec-<ms>);
+    // either way lexical sort is chronological. Newest first.
     packs.sort_by(|a, b| b.id.cmp(&a.id));
     Ok(packs)
 }
@@ -542,12 +544,18 @@ fn start_recording(
     }
     ensure_daemon(&app, &mut g)?;
 
-    let epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_millis();
-    let id = format!("rec-{epoch}");
-    let dir = recordings_root(&app).join(&id);
+    // Human-readable, local wall-clock name. ISO order == lexical order, so the
+    // library's lexical sort stays chronological. Seconds make it unique; the
+    // guard below covers the (basically impossible) same-second collision.
+    let base = format!("rollpack-{}", chrono::Local::now().format("%Y-%m-%d-%H-%M-%S"));
+    let root = recordings_root(&app);
+    let mut id = base.clone();
+    let mut n = 2;
+    while root.join(&id).exists() {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    let dir = root.join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let cam = config
