@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: edator (the editing agent roll feeds)
+    url: https://github.com/StuMason/edator
+    about: For questions about the edit itself, not capture.
+  - name: crunch (pack → joined index)
+    url: https://github.com/StuMason/crunch
+    about: For how a pack is processed into crunch.json.
