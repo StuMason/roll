@@ -2,102 +2,109 @@
 
 **Record once. Hand the agent a queryable pack.**
 
-`roll` is a screen + camera + mic recorder that captures **input telemetry**
-— clicks, keystrokes, window focus — on the *same clock* as the video, then
-processes a take into a deterministic, **agent-queryable pack**. An LLM doesn't
-watch the footage; it *queries the pack* and decides the edit.
+[![CI](https://github.com/StuMason/roll/actions/workflows/app-mac.yml/badge.svg)](https://github.com/StuMason/roll/actions/workflows/app-mac.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-black)
 
-It's the capture front-end for [edator](https://github.com/StuMason/edator):
-`roll` makes the recording, edator makes the cut.
+`roll` is a native macOS recorder that captures **screen + camera + mic + system
+audio on one shared clock**, alongside rich **input & semantic telemetry** —
+every click, drag, keystroke, scroll, the typed text, the clipboard, the app/window
+focus timeline, and the accessibility role/label of whatever you clicked. A take
+isn't a video file, it's a deterministic **pack**: raw source an editing agent can
+*query* instead of *watch*.
 
-> **Status: early.** The desktop shell, the pack contract, the mock capture
-> backend, and the universal CI build all work today. The real macOS capture
-> engine and the cruncher are deliberately *not* built yet — see
-> [What works today](#what-works-today).
+It's the capture front-end for **[edator](https://github.com/StuMason/edator)**:
+`roll` makes the recording, [crunch](https://github.com/StuMason/crunch) turns it
+into a joined index, edator makes the cut.
 
 ## Why
 
 Every screen recorder throws away the most useful thing in the room: **what you
-actually did.** The cursor coordinates, the click on the *Deploy* button, the
-window you switched to — all discarded the moment it renders to pixels. An
-editing agent then has to *infer* those events back out of the video, expensively.
+actually did.** The cursor path, the click on the *Deploy* button, the search you
+typed, the window you switched to — all discarded the moment it renders to pixels.
+An editing agent then has to *infer* those events back out of the video, expensively
+and unreliably.
 
-`roll` keeps them. A take isn't a video file, it's a **pack**: the rolls, plus a
-timeline of input events, plus an index — so the click at `t=63.2s` can be
-joined to the on-screen text under the cursor *and* the words being spoken at
-that instant. That join — `click × OCR × transcript` — is the thing no recorder
-currently hands to an agent.
+`roll` keeps them. The click at `t=63.2s` can be joined to the on-screen text under
+the cursor **and** the words being spoken at that instant. That join —
+`click × OCR × transcript` — is the raw material no recorder currently hands to an
+agent. Get the capture right once (it's Rubbish-In-Rubbish-Out) and everything
+downstream gets easier.
+
+## What roll captures
+
+| Source | Detail |
+|---|---|
+| **screen.mp4** | ScreenCaptureKit, native resolution, **constant frame rate**, monotonic PTS — frame-accurate cutting |
+| **camera.mp4** | AVFoundation, incl. iPhone Continuity Camera; single persistent session (live preview *through* recording, no dropout) |
+| **mic.m4a** | AAC, separate track |
+| **sysaudio.m4a** | system/app audio on its own track (mic stays clean) |
+| **metadata.jsonl** | `click` · `drag` · `cursor` · `key` · `scroll` · `app_focus` · `text` (typed) · `clipboard` — every row on the shared `t_ms` clock, coordinates in `screen.mp4` pixel space |
+| **keyframes/** | pristine full-res PNGs snapshotted on click / app-switch (clean OCR, no re-decode) |
+| **manifest.json** | the index: clock origin, fps, per-source sync offsets, display geometry |
+
+Typed text and clipboard are **never** captured while macOS secure input is active
+(password fields). The contract is enforced by
+[`schemas/pack.schema.json`](schemas/pack.schema.json).
 
 ## Architecture
 
+The Rust/Tauri app owns no capture logic — it drives a persistent native Swift
+sidecar (`roll-capture`) that owns the camera the whole time (the OBS model: one
+session feeds both the live preview and the recording).
+
 ```mermaid
-flowchart TD
-  subgraph mac["Your Mac — the only place capture can run"]
-    SCK["ScreenCaptureKit / AVFoundation"]
-    IN["global input monitor"]
+flowchart LR
+  subgraph app["Tauri app (Rust + React)"]
+    UI["UI · previews · VU meter · pack inspector"]
+    RS["Rust shell (src-tauri)"]
   end
+  SC["roll-capture<br/>persistent Swift daemon"]
+  PACK[("pack on disk<br/>~/Movies/roll/rec-&lt;epoch&gt;/")]
 
-  subgraph roll["roll (this repo)"]
-    UI["Tauri UI: pick sources · Record/Stop"]
-    BE["CaptureBackend trait"]
-    PK["pack writer: manifest + metadata.jsonl"]
-    UI --> BE --> PK
-  end
-
-  subgraph pack["A take = a pack (one shared clock)"]
-    S["screen.mp4 / camera.mp4 / mic.m4a"]
-    M["metadata.jsonl — clicks/keys/windows"]
-    MF["manifest.json — the index"]
-  end
-
-  subgraph server["Cruncher (runs headless — ffmpeg + crunch)"]
-    X["transcript · scenes · OCR · captions · embeddings"]
-    J["click × OCR × transcript → action events"]
-  end
-
-  SCK --> BE
-  IN --> PK
-  PK --> S & M & MF
-  S & M & MF --> X --> J
-  J -->|queried via CLI / MCP| AGENT["editing agent → edit pack → ffmpeg render"]
+  UI -- "invoke (devices, preview, start/stop)" --> RS
+  RS -- "stdin commands · stream frames/levels/state" --> SC
+  SC -- "screen · camera · mic · sysaudio · telemetry · keyframes" --> PACK
+  PACK -->|pack| CRUNCH["crunch → crunch.json"] --> EDATOR["edator → the cut"]
 ```
 
-The hard boundary is the **pack** (see [`schemas/pack.schema.json`](schemas/pack.schema.json)).
-Everything upstream is capture; everything downstream is an agent querying facts.
-Get the boundary right and each half evolves independently.
+The hard boundary is the **pack**: everything upstream is capture, everything
+downstream is an agent querying facts. Get the boundary right and each half evolves
+independently.
 
-## What works today
+## Build & run
 
-| Piece | State |
-| --- | --- |
-| Tauri desktop shell (source picker, record/stop, live timer) | ✅ runs |
-| `CaptureBackend` trait + **mock** backend (real `metadata.jsonl`, placeholder media) | ✅ runs everywhere, incl. headless Linux |
-| Pack contract — typed Rust + JSON Schema | ✅ |
-| Universal macOS (Intel + Apple Silicon) + Win + Linux CI build | ✅ `tauri-action` |
-| **Real macOS capture** (ScreenCaptureKit/AVFoundation + input monitor) | ⛔ stub — gated on the pack/join proof |
-| **Cruncher** (ffmpeg + crunch → pack + action-event join) | ⛔ next, once a real recording exists |
-
-The mock backend is deliberate: it lets the *entire* record → pack loop be
-built and run on a headless box, with the one platform-specific piece — the Mac
-capture engine — slotting in behind the trait later, without touching anything
-else. See [`src-tauri/src/capture/`](src-tauri/src/capture/).
-
-## Develop
+Requires macOS 13+, Xcode toolchain, Node, and Rust.
 
 ```bash
-npm install
-npm run tauri dev      # runs the shell with the mock backend
+# 1. build the native capture engine (separate from the app build)
+cd capture-swift && swift build -c release
+.build/release/roll-capture --list        # smoke test: displays / cameras / mics
+
+# 2. run the app (finds the sidecar in capture-swift/.build/release)
+cd .. && npm install
+npm run tauri dev
 ```
 
-On this stack the **shell builds and runs anywhere**; only the real capture
-engine needs macOS. Build artifacts come from CI on real runners.
+Packs land in **`~/Movies/roll/rec-<epoch_ms>/`**. On first run macOS will prompt
+for **Screen Recording, Camera, Microphone, and Accessibility** — all four are
+needed for full capture.
 
 ```bash
-npm run build                         # frontend
+npm run build                                   # frontend
 cargo test  --manifest-path src-tauri/Cargo.toml
-cargo build --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
+
+## Status
+
+The native capture engine is **built and working**: synced multi-source capture,
+constant-frame-rate screen, single-session camera, the full telemetry stream, a
+live camera preview + mic VU meter, and an in-app **pack inspector** (synced
+playback + scrubbable timeline). Downstream, [crunch](https://github.com/StuMason/crunch)
+processes a pack into a joined `crunch.json` and [edator](https://github.com/StuMason/edator)
+turns that into an edit. A signed, notarised, auto-updating `.app` is next.
 
 ## License
 
-MIT © Stuart Mason
+MIT © [Stuart Mason](https://github.com/StuMason)
