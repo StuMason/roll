@@ -1,41 +1,61 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/StuMason/roll/schemas/pack.schema.json",
-  "title": "Roll take",
-  "description": "A recorded take: per-source media + input telemetry + an index, all on one shared clock. This is the contract between the recorder and everything downstream (cruncher, editing agent).",
+  "title": "Roll pack",
+  "description": "A recorded take: per-source media + input/semantic telemetry + a manifest, all on one shared host clock (CACurrentMediaTime). This is the contract between the recorder (roll) and everything downstream (crunch, edator). Reflects what capture-swift actually writes as of v0.0.14. COORDINATES: every x/y and ax.bounds in metadata.jsonl is in screen.mp4 PIXEL space — display-local, top-left origin, already scaled for Retina (no global-offset or points→pixels conversion needed downstream). screen.mp4 is constant-frame-rate at manifest.fps with monotonic PTS. A pack may also contain a keyframes/ dir of pristine full-res PNGs named <t_ms>.png (snapshotted on click / app-switch for clean OCR).",
   "type": "object",
   "$defs": {
-    "sourceKind": { "enum": ["screen", "camera", "mic"] },
-    "packSource": {
+    "sourceRef": {
       "type": "object",
-      "required": ["kind", "file", "fps", "offsetMs"],
+      "description": "A media file plus the PTS of its first written frame on the shared clock.",
+      "required": ["file", "firstPTS"],
       "properties": {
-        "kind": { "$ref": "#/$defs/sourceKind" },
         "file": { "type": "string", "description": "filename within the take directory" },
-        "fps": { "type": "integer", "minimum": 1 },
-        "width": { "type": "integer" },
-        "height": { "type": "integer" },
-        "offsetMs": {
-          "type": "integer",
-          "description": "this source's start relative to the shared clock origin; 0 = aligned"
-        }
+        "firstPTS": { "type": "number", "description": "presentation time of this source's first written frame, in shared-clock seconds" }
+      }
+    },
+    "axContext": {
+      "type": "object",
+      "description": "Accessibility role/label/bounds of the element under the pointer at the moment of the event. Any field may be absent if AX returned nothing.",
+      "properties": {
+        "role": { "type": "string" },
+        "label": { "type": "string" },
+        "bounds": { "type": "array", "items": { "type": "integer" }, "minItems": 4, "maxItems": 4, "description": "[x, y, w, h] in screen.mp4 pixel space, top-left origin, clipped to the visible viewport" }
       }
     },
     "manifest": {
       "type": "object",
-      "required": ["version", "id", "createdEpochMs", "fps", "clock", "sources", "metadataFile"],
+      "description": "manifest.json — the index roll writes when a take is finalized.",
+      "required": ["version", "fps", "t0", "durationMs", "display", "screen", "metadata"],
       "properties": {
         "version": { "type": "string" },
-        "id": { "type": "string" },
-        "createdEpochMs": { "type": "integer" },
-        "fps": { "type": "integer" },
-        "clock": { "type": "string" },
-        "sources": { "type": "array", "items": { "$ref": "#/$defs/packSource" } },
-        "metadataFile": { "const": "metadata.jsonl" }
+        "fps": { "type": "integer", "minimum": 1 },
+        "t0": { "type": "number", "description": "clock origin (CACurrentMediaTime seconds); all event t_ms are ms after this" },
+        "durationMs": { "type": "number" },
+        "display": {
+          "type": "object",
+          "required": ["id", "x", "y", "w", "h"],
+          "properties": {
+            "id": { "type": "integer" },
+            "x": { "type": "integer" }, "y": { "type": "integer" },
+            "w": { "type": "integer" }, "h": { "type": "integer" }
+          }
+        },
+        "screen": { "$ref": "#/$defs/sourceRef" },
+        "camera": { "$ref": "#/$defs/sourceRef", "description": "omitted when no camera was recorded" },
+        "mic": { "$ref": "#/$defs/sourceRef", "description": "omitted when no mic was recorded" },
+        "sysaudio": { "$ref": "#/$defs/sourceRef", "description": "system/app audio, captured on its own track (omitted if none was playing)" },
+        "cameraSyncOffsetMs": { "type": "number", "description": "(camera.firstPTS - screen.firstPTS) * 1000; how far camera.mp4 starts after t0" },
+        "micSyncOffsetMs": { "type": "number", "description": "(mic.firstPTS - screen.firstPTS) * 1000; how far mic.m4a starts after t0" },
+        "sysAudioSyncOffsetMs": { "type": "number", "description": "(sysaudio.firstPTS - screen.firstPTS) * 1000" },
+        "metadata": {
+          "description": "metadata.jsonl filename, or null if telemetry was off (no Accessibility)",
+          "oneOf": [{ "const": "metadata.jsonl" }, { "type": "null" }]
+        }
       }
     },
     "event": {
-      "description": "One row of metadata.jsonl. t_ms is measured from the shared clock origin.",
+      "description": "One row of metadata.jsonl. t_ms is ms since manifest.t0. click/drag also carry optional app/window/ax context.",
       "oneOf": [
         {
           "type": "object",
@@ -43,9 +63,37 @@
           "properties": {
             "type": { "const": "click" },
             "t_ms": { "type": "integer" },
-            "x": { "type": "integer" },
-            "y": { "type": "integer" },
-            "button": { "type": "string" }
+            "x": { "type": "integer" }, "y": { "type": "integer" },
+            "button": { "type": "string" },
+            "mods": { "type": "array", "items": { "type": "string" } },
+            "app": { "type": "string" },
+            "window": { "type": "string" },
+            "ax": { "$ref": "#/$defs/axContext" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "t_ms", "from", "to", "button"],
+          "properties": {
+            "type": { "const": "drag" },
+            "t_ms": { "type": "integer" },
+            "end_ms": { "type": "integer" },
+            "from": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+            "to": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+            "button": { "type": "string" },
+            "mods": { "type": "array", "items": { "type": "string" } },
+            "app": { "type": "string" },
+            "window": { "type": "string" },
+            "ax": { "$ref": "#/$defs/axContext" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "t_ms", "x", "y"],
+          "properties": {
+            "type": { "const": "cursor" },
+            "t_ms": { "type": "integer" },
+            "x": { "type": "integer" }, "y": { "type": "integer" }
           }
         },
         {
@@ -54,18 +102,61 @@
           "properties": {
             "type": { "const": "key" },
             "t_ms": { "type": "integer" },
-            "key": { "type": "string" }
+            "key": { "type": "string" },
+            "mods": { "type": "array", "items": { "type": "string" } }
           }
         },
         {
           "type": "object",
-          "required": ["type", "t_ms", "app", "title", "action"],
+          "required": ["type", "t_ms", "dx", "dy"],
           "properties": {
-            "type": { "const": "window" },
+            "type": { "const": "scroll" },
+            "t_ms": { "type": "integer" },
+            "x": { "type": "integer" }, "y": { "type": "integer" },
+            "dx": { "type": "integer" }, "dy": { "type": "integer" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "t_ms", "app"],
+          "properties": {
+            "type": { "const": "app_focus" },
             "t_ms": { "type": "integer" },
             "app": { "type": "string" },
-            "title": { "type": "string" },
-            "action": { "type": "string" }
+            "window": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "description": "human 'good bit' marker dropped via the ⌃⌥⌘M hotkey during recording — the highest-priority editorial signal",
+          "required": ["type", "t_ms"],
+          "properties": {
+            "type": { "const": "marker" },
+            "t_ms": { "type": "integer" }
+          }
+        },
+        {
+          "type": "object",
+          "description": "accumulated typed text (search queries, prompts, commands), flushed on Enter/Tab/focus-change. Never captured while macOS secure input is active.",
+          "required": ["type", "t_ms", "text"],
+          "properties": {
+            "type": { "const": "text" },
+            "t_ms": { "type": "integer" },
+            "end_ms": { "type": "integer" },
+            "text": { "type": "string" },
+            "app": { "type": "string" },
+            "window": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "description": "copied text (capped to 2000 chars). Skips concealed/secure payloads.",
+          "required": ["type", "t_ms", "text"],
+          "properties": {
+            "type": { "const": "clipboard" },
+            "t_ms": { "type": "integer" },
+            "chars": { "type": "integer", "description": "full length before capping" },
+            "text": { "type": "string" }
           }
         }
       ]

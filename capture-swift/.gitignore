@@ -1,0 +1,6 @@
+# SwiftPM build products
+.build/
+
+# throwaway capture-test output dirs
+pack*/
+test*/

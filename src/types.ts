@@ -1,31 +1,78 @@
-// Mirror of the Rust contract in src-tauri/src/pack.rs.
-// Keep these in lockstep — this is the JS side of the IPC boundary.
+// The JS side of the IPC boundary. Mirrors the Rust contract where it crosses
+// (see src-tauri/src/lib.rs commands + events).
 
-export type SourceKind = "screen" | "camera" | "mic";
-
-export interface SourceInfo {
-  kind: SourceKind;
-  id: string;
+export interface Device {
+  index: number;
   label: string;
+  // displays carry their screen frame (for the highlight overlay)
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+}
+
+export interface Devices {
+  displays: Device[];
+  cameras: Device[];
+  mics: Device[];
+}
+
+export type RecState = "idle" | "warming" | "recording" | "saving";
+
+export interface LiveStats {
+  warmedMs?: number;
+  elapsedMs: number;
+  screenFrames?: number;
+  cameraFrames?: number;
+  clicks?: number;
+  rows?: number;
 }
 
 export interface RecordConfig {
-  sources: SourceKind[];
+  display: number;
+  camera: number | null;
+  mic: number | null;
   fps: number;
 }
 
-export interface PackSource {
-  kind: SourceKind;
-  file: string;
-  fps: number;
-  width?: number;
-  height?: number;
-  offsetMs: number;
-}
-
-export interface RecordingResult {
+export interface Pack {
   id: string;
   dir: string;
   durationMs: number;
-  sources: PackSource[];
+  sources: string[]; // e.g. ["screen.mp4","camera.mp4","mic.m4a","metadata.jsonl"]
+  rows?: number; // metadata rows
+  cameraSyncOffsetMs?: number;
+  micSyncOffsetMs?: number;
+}
+
+// Payload of the "roll://state" event the backend emits while a take runs.
+export interface StateEvent {
+  state: RecState;
+  stats: LiveStats;
+}
+
+// One telemetry row from metadata.jsonl. Shape varies by `type`; the common
+// field is t_ms (ms since the shared t0). Loose by design.
+export interface TEvent {
+  type: "click" | "drag" | "cursor" | "key" | "scroll" | "app_focus" | string;
+  t_ms: number;
+  end_ms?: number;
+  x?: number;
+  y?: number;
+  from?: [number, number];
+  to?: [number, number];
+  button?: string;
+  mods?: string[];
+  key?: string;
+  dx?: number;
+  dy?: number;
+  app?: string;
+  window?: string;
+  ax?: { role?: string; label?: string; bounds?: number[] };
+}
+
+export interface PackDetail {
+  // manifest.json verbatim (fps, t0, durationMs, sync offsets, display, …)
+  manifest: Record<string, unknown> | null;
+  events: TEvent[];
 }

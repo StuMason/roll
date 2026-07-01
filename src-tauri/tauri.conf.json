@@ -10,18 +10,23 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "Roll",
-        "width": 360,
-        "height": 520,
+        "title": "roll",
+        "width": 900,
+        "height": 700,
         "resizable": true,
-        "minWidth": 320,
-        "minHeight": 420
+        "minWidth": 720,
+        "minHeight": 560
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$VIDEO/roll/**", "$HOME/Movies/roll/**"]
+      }
     }
   },
   "bundle": {
