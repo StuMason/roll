@@ -128,15 +128,6 @@
         },
         {
           "type": "object",
-          "description": "human 'good bit' marker dropped via the ⌃⌥⌘M hotkey during recording — the highest-priority editorial signal",
-          "required": ["type", "t_ms"],
-          "properties": {
-            "type": { "const": "marker" },
-            "t_ms": { "type": "integer" }
-          }
-        },
-        {
-          "type": "object",
           "description": "accumulated typed text (search queries, prompts, commands), flushed on Enter/Tab/focus-change. Never captured while macOS secure input is active.",
           "required": ["type", "t_ms", "text"],
           "properties": {

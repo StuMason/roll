@@ -620,12 +620,6 @@ final class Telemetry {
             let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
             let f = event.flags
             let cmd = f.contains(.maskCommand), ctrl = f.contains(.maskControl), alt = f.contains(.maskAlternate)
-            // #2 marker: ⌃⌥⌘M drops a human "good bit" marker (not logged as a key)
-            if ctrl && alt && cmd && code == 46 {
-                flushTyped(at: now)
-                write(["type": "marker", "t_ms": stamp(now)])
-                break
-            }
             // #3 typed-text: NEVER capture while macOS secure input is on (passwords)
             if IsSecureEventInputEnabled() { flushTyped(at: now); break }
             let char = NSEvent(cgEvent: event)?.charactersIgnoringModifiers ?? ""

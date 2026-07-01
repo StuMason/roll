@@ -37,13 +37,14 @@ function describe(e: TEvent): string {
 
 export default function PackInspector({ pack, onClose }: { pack: Pack; onClose: () => void }) {
   const [detail, setDetail] = useState<PackDetail | null>(null);
-  const [src, setSrc] = useState<{ screen: string; camera: string; mic: string }>({ screen: "", camera: "", mic: "" });
+  const [src, setSrc] = useState<{ screen: string; camera: string; mic: string; sysaudio: string }>({ screen: "", camera: "", mic: "", sysaudio: "" });
   const [playing, setPlaying] = useState(false);
   const [now, setNow] = useState(0); // ms
 
   const screenRef = useRef<HTMLVideoElement>(null);
   const cameraRef = useRef<HTMLVideoElement>(null);
   const micRef = useRef<HTMLAudioElement>(null);
+  const sysRef = useRef<HTMLAudioElement>(null);
   const raf = useRef<number>(0);
 
   const has = (f: string) => pack.sources.includes(f);
@@ -51,14 +52,14 @@ export default function PackInspector({ pack, onClose }: { pack: Pack; onClose: 
 
   useEffect(() => {
     readPack(pack.dir).then(setDetail).catch(() => setDetail({ manifest: null, events: [] }));
-    Promise.all([mediaSrc(pack.dir, "screen.mp4"), mediaSrc(pack.dir, "camera.mp4"), mediaSrc(pack.dir, "mic.m4a")]).then(
-      ([screen, camera, mic]) => setSrc({ screen, camera, mic }),
+    Promise.all([mediaSrc(pack.dir, "screen.mp4"), mediaSrc(pack.dir, "camera.mp4"), mediaSrc(pack.dir, "mic.m4a"), mediaSrc(pack.dir, "sysaudio.m4a")]).then(
+      ([screen, camera, mic, sysaudio]) => setSrc({ screen, camera, mic, sysaudio }),
     );
   }, [pack.dir]);
 
-  // the three media elements share one clock: screen is master, camera + mic
-  // are slaved and resynced if they drift more than a frame
-  const slaves = () => [cameraRef.current, micRef.current].filter(Boolean) as HTMLMediaElement[];
+  // all media share one clock: screen is master; camera + mic + system audio are
+  // slaved and resynced if they drift more than a frame
+  const slaves = () => [cameraRef.current, micRef.current, sysRef.current].filter(Boolean) as HTMLMediaElement[];
 
   function tick() {
     const m = screenRef.current;
@@ -151,6 +152,7 @@ export default function PackInspector({ pack, onClose }: { pack: Pack; onClose: 
                onEnded={() => setPlaying(false)} />
         {has("camera.mp4") && <video ref={cameraRef} className="insp-cam" src={src.camera} muted playsInline />}
         {has("mic.m4a") && <audio ref={micRef} src={src.mic} />}
+        {has("sysaudio.m4a") && <audio ref={sysRef} src={src.sysaudio} />}
 
         <div className="insp-now">
           <span className="now-app">{currentApp ? `${currentApp.app}${currentApp.window ? ` · ${currentApp.window}` : ""}` : "—"}</span>

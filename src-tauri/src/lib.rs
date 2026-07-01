@@ -384,7 +384,13 @@ fn last_event_ms(dir: &Path) -> Option<u64> {
 
 fn build_pack(dir: &Path, id: &str, duration_ms: u64) -> Pack {
     let mut sources = Vec::new();
-    for f in ["screen.mp4", "camera.mp4", "mic.m4a", "metadata.jsonl"] {
+    for f in [
+        "screen.mp4",
+        "camera.mp4",
+        "mic.m4a",
+        "sysaudio.m4a",
+        "metadata.jsonl",
+    ] {
         if dir.join(f).exists() {
             sources.push(f.to_string());
         }

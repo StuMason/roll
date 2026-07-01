@@ -7,7 +7,7 @@
 
 The capture-side truths that only the recorder can get are **done** and in the pack contract (`schemas/pack.schema.json`):
 
-- **#2 marker** — `⌃⌥⌘M` during recording drops `{type:"marker", t_ms}`. Highest-priority editorial signal (`source:"human"`).
+- **#2 marker** — dropped. A keyboard chord to remember is worse than just *saying* "that was a good bit" out loud; crunch already turns spoken cues into moments, so the transcript is the marker.
 - **#3 typed-text** — printable keystrokes accumulate into `{type:"text", t_ms, end_ms, text, app, window}`, flushed on Enter/Tab/focus-change. **Never captured while macOS secure input is active.** (Plain keys no longer spam `key` events; `key` now = shortcuts/special keys only.)
 - **#4 clipboard** — `{type:"clipboard", t_ms, chars, text}` (capped 2000, skips concealed/secure payloads).
 - **#5 keyframes** — pristine full-res PNGs in `keyframes/<t_ms>.png`, snapshotted on click / app-switch. **OCR these directly — no H.264 re-decode, no motion blur.**
