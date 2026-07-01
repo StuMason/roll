@@ -66,15 +66,23 @@ export default function PackInspector({ pack, onClose }: { pack: Pack; onClose: 
     if (m) {
       setNow(m.currentTime * 1000);
       for (const s of slaves()) {
-        if (Math.abs(s.currentTime - m.currentTime) > 0.05) s.currentTime = m.currentTime;
+        // Only nudge a slave that's actually running (readyState≥2) and not
+        // mid-seek. Hammering currentTime while an <audio> is still buffering its
+        // play() stalls it entirely — that was the "no sound at all" bug.
+        if (!s.seeking && s.readyState >= 2 && Math.abs(s.currentTime - m.currentTime) > 0.2) {
+          s.currentTime = m.currentTime;
+        }
       }
     }
     raf.current = requestAnimationFrame(tick);
   }
 
   function play() {
-    screenRef.current?.play();
-    slaves().forEach((s) => s.play());
+    screenRef.current?.play().catch(() => {});
+    slaves().forEach((s) => {
+      s.volume = 1; // audio elements: ensure audible (video slaves stay muted)
+      s.play().catch(() => {});
+    });
     setPlaying(true);
     cancelAnimationFrame(raf.current);
     raf.current = requestAnimationFrame(tick);

@@ -146,6 +146,10 @@ fn frame_loop(app: AppHandle, stdout: std::process::ChildStdout) {
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         if let Some(b64) = line.strip_prefix("FRAME ") {
             let _ = app.emit("roll://frame", format!("data:image/jpeg;base64,{b64}"));
+        } else if let Some(lvl) = line.strip_prefix("LEVEL ") {
+            if let Ok(v) = lvl.trim().parse::<f32>() {
+                let _ = app.emit("roll://level", v);
+            }
         }
     }
 }
@@ -505,6 +509,27 @@ fn set_preview_camera(
     Ok(())
 }
 
+/// Point the mic level meter at a mic (or `None` to release it). Levels stream
+/// via `roll://level` (0..1 RMS).
+#[tauri::command]
+fn set_preview_mic(
+    app: AppHandle,
+    state: State<AppState>,
+    index: Option<u32>,
+) -> Result<(), String> {
+    let mut g = state.0.lock().unwrap();
+    ensure_daemon(&app, &mut g)?;
+    let arg = index
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "none".into());
+    let d = g.daemon.as_mut().unwrap();
+    d.stdin
+        .write_all(format!("mic {arg}\n").as_bytes())
+        .map_err(|e| e.to_string())?;
+    d.stdin.flush().ok();
+    Ok(())
+}
+
 #[tauri::command]
 fn start_recording(
     app: AppHandle,
@@ -681,6 +706,7 @@ pub fn run() {
             list_packs,
             read_pack,
             set_preview_camera,
+            set_preview_mic,
             start_recording,
             stop_recording,
             reveal,

@@ -1042,9 +1042,68 @@ final class CameraStation: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 }
 
+// A metering-only mic session: streams RMS level (0..1) to stdout as `LEVEL <v>`
+// so the UI can show a live VU bar whenever a mic is selected — idle and during
+// recording. Independent of MicRecorder (audio devices allow multiple clients).
+final class MicMeter: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let session = AVCaptureSession()
+    private let q = DispatchQueue(label: "roll.micmeter")
+    private var currentInput: AVCaptureDeviceInput?
+    private let output = AVCaptureAudioDataOutput()
+    private var lastEmit = 0.0
+    private let interval = 1.0 / 15.0
+
+    override init() {
+        super.init()
+        output.audioSettings = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        output.setSampleBufferDelegate(self, queue: q)
+    }
+
+    func open(_ dev: AVCaptureDevice) {
+        session.beginConfiguration()
+        if let ci = currentInput { session.removeInput(ci); currentInput = nil }
+        if let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) {
+            session.addInput(input); currentInput = input
+        }
+        if session.canAddOutput(output), !session.outputs.contains(output) { session.addOutput(output) }
+        session.commitConfiguration()
+        if !session.isRunning { session.startRunning() }
+        err("🎙 meter: \(dev.localizedName)")
+    }
+
+    func close() {
+        if session.isRunning { session.stopRunning() }
+        if let ci = currentInput { session.beginConfiguration(); session.removeInput(ci); session.commitConfiguration(); currentInput = nil }
+        outLine("LEVEL 0")
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let now = CACurrentMediaTime()
+        guard now - lastEmit >= interval, let bb = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        var length = 0
+        var dataPtr: UnsafeMutablePointer<Int8>?
+        guard CMBlockBufferGetDataPointer(bb, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPtr) == kCMBlockBufferNoErr,
+              let dp = dataPtr, length >= MemoryLayout<Float>.size else { return }
+        let count = length / MemoryLayout<Float>.size
+        let samples = UnsafeRawPointer(dp).assumingMemoryBound(to: Float.self)
+        var sum: Float = 0
+        for i in 0..<count { let s = samples[i]; sum += s * s }
+        let rms = sqrtf(sum / Float(count))
+        lastEmit = now
+        outLine("LEVEL \(String(format: "%.4f", min(1.0, rms)))")
+    }
+}
+
 @available(macOS 13.0, *)
 final class Daemon {
     let station = CameraStation()
+    let micMeter = MicMeter()
     private var screen: ScreenRecorder?
     private var mic: MicRecorder?
     private var telemetry: Telemetry?
@@ -1066,6 +1125,13 @@ final class Daemon {
                 let devs = cameraDevices()
                 if i < devs.count { station.open(devs[i]) } else { err("no camera \(i)") }
             }
+        case "mic":
+            let arg = parts.count > 1 ? parts[1] : "none"
+            if arg == "none" { micMeter.close() }
+            else if let i = Int(arg) {
+                let devs = micDevices()
+                if i < devs.count { micMeter.open(devs[i]) } else { err("no mic \(i)") }
+            }
         case "rec":
             guard !recording, parts.count >= 6,
                   let s = Int(parts[1]), let f = Int(parts[4]) else { err("bad rec command"); return }
@@ -1076,6 +1142,7 @@ final class Daemon {
         case "quit":
             if recording { await stopRec() }
             station.close()
+            micMeter.close()
             exit(0)
         default:
             err("unknown command: \(cmd)")

@@ -164,6 +164,13 @@ export async function setPreviewCamera(index: number | null): Promise<void> {
   await core.invoke("set_preview_camera", { index });
 }
 
+// Point the mic level meter at a mic, or null to release it (levels via onLevel).
+export async function setPreviewMic(index: number | null): Promise<void> {
+  if (!isTauri) return;
+  const { core } = await tauri();
+  await core.invoke("set_preview_mic", { index });
+}
+
 export async function highlightDisplay(x: number, y: number, w: number, h: number): Promise<void> {
   if (!isTauri) {
     // eslint-disable-next-line no-console
@@ -219,6 +226,14 @@ export async function onFrame(cb: Listener<string>): Promise<() => void> {
   if (!isTauri) return () => {}; // no live feed in the browser mock
   const { event } = await tauri();
   const un = await event.listen<string>("roll://frame", (e) => cb(e.payload));
+  return un;
+}
+
+// Live mic level (0..1 RMS) from the daemon's meter.
+export async function onLevel(cb: Listener<number>): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { event } = await tauri();
+  const un = await event.listen<number>("roll://level", (e) => cb(e.payload));
   return un;
 }
 

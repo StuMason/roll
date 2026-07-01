@@ -165,7 +165,10 @@ body {
 .row { display: flex; gap: 12px; align-items: flex-end; }
 .row .field { flex: 1; }
 .row .ghost { flex: 0 0 auto; }
-.row.two { display: grid; grid-template-columns: 1fr 1fr; }
+.row.two { display: grid; grid-template-columns: 1fr 1fr; align-items: start; }
+.mic-field { display: flex; flex-direction: column; gap: 6px; }
+.mic-meter { height: 6px; border-radius: 3px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
+.mic-meter-fill { height: 100%; border-radius: 3px; transition: width 0.06s linear; }
 
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field-label {

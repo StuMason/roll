@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Dropdown, { Opt } from "./components/Dropdown";
 import CameraPreview from "./components/CameraPreview";
+import MicMeter from "./components/MicMeter";
 import PackInspector from "./components/PackInspector";
-import { ENGINE, highlightDisplay, listDevices, listPacks, onSaved, onState, reveal, screenShot, setPreviewCamera, startRecording, stopRecording } from "./api";
+import { ENGINE, highlightDisplay, listDevices, listPacks, onSaved, onState, reveal, screenShot, setPreviewCamera, setPreviewMic, startRecording, stopRecording } from "./api";
 import type { Devices, LiveStats, Pack, RecState, RecordConfig } from "./types";
 
 const SAVED = "roll.cfg.v1";
@@ -107,6 +108,12 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera, devices !== null]);
 
+  // Point the mic level meter at the selected mic (persists through recording).
+  useEffect(() => {
+    if (devices && state === "idle") setPreviewMic(mic).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mic, devices !== null]);
+
   // refresh the screen thumbnail whenever the picked display changes (idle only)
   useEffect(() => {
     if (devices && state === "idle") refreshShot(display);
@@ -194,7 +201,10 @@ export default function App() {
           </div>
           <div className="row two">
             <Dropdown label="Camera" value={camera} options={cameraOpts} onChange={setCamera} disabled={busy} />
-            <Dropdown label="Microphone" value={mic} options={micOpts} onChange={setMic} disabled={busy} />
+            <div className="mic-field">
+              <Dropdown label="Microphone" value={mic} options={micOpts} onChange={setMic} disabled={busy} />
+              <MicMeter active={mic !== null} />
+            </div>
           </div>
           <div className="field">
             <span className="field-label">Frame rate</span>
