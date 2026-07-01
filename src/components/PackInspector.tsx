@@ -57,20 +57,30 @@ export default function PackInspector({ pack, onClose }: { pack: Pack; onClose: 
     );
   }, [pack.dir]);
 
-  // all media share one clock: screen is master; camera + mic + system audio are
-  // slaved and resynced if they drift more than a frame
-  const slaves = () => [cameraRef.current, micRef.current, sysRef.current].filter(Boolean) as HTMLMediaElement[];
+  // Audio is the master clock — it plays perfectly smoothly, so we NEVER seek it
+  // mid-playback (seeking an <audio> = an audible glitch). The video elements are
+  // the ones nudged to match; a stuttering 1080p decode can hitch the picture but
+  // must never drag the sound. Master = mic → sysaudio → screen (whatever exists).
+  const audioEls = () => [micRef.current, sysRef.current].filter(Boolean) as HTMLMediaElement[];
+  const videoEls = () => [screenRef.current, cameraRef.current].filter(Boolean) as HTMLMediaElement[];
+  const allEls = () => [...videoEls(), ...audioEls()];
+  const master = () => micRef.current ?? sysRef.current ?? screenRef.current;
+  const lastNowMs = useRef(0);
 
   function tick() {
-    const m = screenRef.current;
+    const m = master();
     if (m) {
-      setNow(m.currentTime * 1000);
-      for (const s of slaves()) {
-        // Only nudge a slave that's actually running (readyState≥2) and not
-        // mid-seek. Hammering currentTime while an <audio> is still buffering its
-        // play() stalls it entirely — that was the "no sound at all" bug.
-        if (!s.seeking && s.readyState >= 2 && Math.abs(s.currentTime - m.currentTime) > 0.2) {
-          s.currentTime = m.currentTime;
+      const ms = m.currentTime * 1000;
+      // throttle the React "now" update to ~20Hz — 60fps re-renders of the whole
+      // timeline were themselves janking playback
+      if (Math.abs(ms - lastNowMs.current) >= 50) {
+        lastNowMs.current = ms;
+        setNow(ms);
+      }
+      // nudge only the VIDEO to the (audio) master; audio is never touched here
+      for (const v of videoEls()) {
+        if (v !== m && !v.seeking && v.readyState >= 2 && Math.abs(v.currentTime - m.currentTime) > 0.25) {
+          v.currentTime = m.currentTime;
         }
       }
     }
@@ -78,25 +88,25 @@ export default function PackInspector({ pack, onClose }: { pack: Pack; onClose: 
   }
 
   function play() {
-    screenRef.current?.play().catch(() => {});
-    slaves().forEach((s) => {
-      s.volume = 1; // audio elements: ensure audible (video slaves stay muted)
-      s.play().catch(() => {});
+    const t = master()?.currentTime ?? 0;
+    allEls().forEach((e) => {
+      if (Math.abs(e.currentTime - t) > 0.05) e.currentTime = t; // one sync, then free-run
+      e.volume = 1;
+      e.play().catch(() => {});
     });
     setPlaying(true);
     cancelAnimationFrame(raf.current);
     raf.current = requestAnimationFrame(tick);
   }
   function pause() {
-    screenRef.current?.pause();
-    slaves().forEach((s) => s.pause());
+    allEls().forEach((e) => e.pause());
     setPlaying(false);
     cancelAnimationFrame(raf.current);
   }
   function seekMs(ms: number) {
     const t = Math.max(0, Math.min(durationMs, ms)) / 1000;
-    if (screenRef.current) screenRef.current.currentTime = t;
-    slaves().forEach((s) => (s.currentTime = t));
+    allEls().forEach((e) => (e.currentTime = t)); // explicit seek touches everything
+    lastNowMs.current = ms;
     setNow(ms);
   }
 
