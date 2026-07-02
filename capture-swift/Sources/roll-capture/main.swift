@@ -53,6 +53,23 @@ func argVal(_ name: String) -> String? {
     if let i = a.firstIndex(of: name), i + 1 < a.count { return a[i + 1] }
     return nil
 }
+
+// Ask macOS for camera/mic consent explicitly. A bare AVCaptureDeviceInput init
+// silently fails while authorization is notDetermined — the OS only shows the
+// consent prompt on requestAccess. Dev builds never hit this (the spawning
+// terminal's grant covers them); the installed app has its own TCC identity and
+// must ask, or every camera sits at "connecting…" forever with no prompt.
+func ensureAVAccess() {
+    for media in [AVMediaType.video, .audio]
+    where AVCaptureDevice.authorizationStatus(for: media) == .notDetermined {
+        let sem = DispatchSemaphore(value: 0)
+        AVCaptureDevice.requestAccess(for: media) { ok in
+            err("\(media == .video ? "camera" : "mic") access \(ok ? "granted" : "DENIED by user")")
+            sem.signal()
+        }
+        sem.wait()
+    }
+}
 func err(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 let args = CommandLine.arguments
 
@@ -840,6 +857,7 @@ func captureShot(index: Int, maxW: Int) async {
 @available(macOS 13.0, *)
 func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int, secs: Double, w: Int?, h: Int?) async {
     do {
+        ensureAVAccess()
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard screenIdx < content.displays.count else { err("no display \(screenIdx)"); exit(1) }
         let display = content.displays[screenIdx]
@@ -1301,6 +1319,7 @@ final class Daemon {
 
 @available(macOS 13.0, *)
 func serve() {
+    ensureAVAccess()   // consent prompt at app launch, before any camera open
     let daemon = Daemon()
     // graceful shutdown so a finalize-in-flight isn't truncated by a signal
     for sig in [SIGTERM, SIGINT, SIGHUP] {
