@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/StuMason/roll/schemas/pack.schema.json",
   "title": "Roll pack",
-  "description": "A recorded take: per-source media + input/semantic telemetry + a manifest, all on one shared host clock (CACurrentMediaTime). This is the contract between the recorder (roll) and everything downstream (crunch, edator). Reflects what capture-swift actually writes as of v0.0.14. COORDINATES: every x/y and ax.bounds in metadata.jsonl is in screen.mp4 PIXEL space — display-local, top-left origin, already scaled for Retina (no global-offset or points→pixels conversion needed downstream). screen.mp4 is constant-frame-rate at manifest.fps with monotonic PTS. A pack may also contain a keyframes/ dir of pristine full-res PNGs named <t_ms>.png (snapshotted on click / app-switch for clean OCR).",
+  "description": "A recorded take: per-source media + input/semantic telemetry + a manifest, all on one shared host clock (CACurrentMediaTime). This is the contract between the recorder (roll) and everything downstream (crunch, edator). Reflects what capture-swift actually writes as of v0.0.15. COORDINATES: every x/y and ax.bounds in metadata.jsonl is in screen.mp4 PIXEL space — display-local, top-left origin, already scaled for Retina (no global-offset or points→pixels conversion needed downstream). screen.mp4 is constant-frame-rate at manifest.fps with monotonic PTS. A pack may also contain a keyframes/ dir of pristine full-res PNGs named <t_ms>.png (snapshotted on click / app-switch for clean OCR).",
   "type": "object",
   "$defs": {
     "sourceRef": {
@@ -12,6 +12,24 @@
       "properties": {
         "file": { "type": "string", "description": "filename within the take directory" },
         "firstPTS": { "type": "number", "description": "presentation time of this source's first written frame, in shared-clock seconds" }
+      }
+    },
+    "cameraRef": {
+      "type": "object",
+      "description": "camera.mp4 sourceRef plus the encode settings it was written with, so downstream tools can reason about what they got.",
+      "required": ["file", "firstPTS"],
+      "properties": {
+        "file": { "type": "string", "description": "filename within the take directory" },
+        "firstPTS": { "type": "number", "description": "presentation time of this source's first written frame, in shared-clock seconds" },
+        "encode": {
+          "type": "object",
+          "required": ["w", "h", "bitrate"],
+          "properties": {
+            "w": { "type": "integer" },
+            "h": { "type": "integer" },
+            "bitrate": { "type": "integer", "description": "H.264 average bitrate in bits/s" }
+          }
+        }
       }
     },
     "axContext": {
@@ -42,7 +60,7 @@
           }
         },
         "screen": { "$ref": "#/$defs/sourceRef" },
-        "camera": { "$ref": "#/$defs/sourceRef", "description": "omitted when no camera was recorded" },
+        "camera": { "$ref": "#/$defs/cameraRef", "description": "omitted when no camera was recorded" },
         "mic": { "$ref": "#/$defs/sourceRef", "description": "omitted when no mic was recorded" },
         "sysaudio": { "$ref": "#/$defs/sourceRef", "description": "system/app audio, captured on its own track (omitted if none was playing)" },
         "cameraSyncOffsetMs": { "type": "number", "description": "(camera.firstPTS - screen.firstPTS) * 1000; how far camera.mp4 starts after t0" },
