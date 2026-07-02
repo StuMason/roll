@@ -20,7 +20,7 @@ import Carbon.HIToolbox   // IsSecureEventInputEnabled (skip capture in password
 // Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
 // truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.15"
+let VERSION = "0.0.16"
 
 // keyCodes that have no sensible printable character — named so the key stream
 // is legible (charactersIgnoringModifiers returns control/unicode junk for these)
@@ -65,6 +65,22 @@ let camWidth = camHeight * 16 / 9
 let camBitrate = Int(argVal("--cam-bitrate") ?? "") ?? 6_000_000
 let camPreset: AVCaptureSession.Preset = camHeight <= 720 ? .hd1280x720 : .hd1920x1080
 
+// Pack proxy (#13): a small analysis copy (camera.proxy.mp4) written live next to
+// the master so the /pack upload can swap it in and stay under Cloudflare's 100MB
+// edge cap. 480p @ 600 kbps ≈ 34MB per 7.5 min — plenty for face/presence work;
+// edator keeps rendering from the full-res master.
+let PROXY_W = 854, PROXY_H = 480, PROXY_BITRATE = 600_000
+
+// manifest.camera — encode settings + proxy pointer, shared by both stop paths
+func cameraManifestBlock(firstPTS: Double, proxyWritten: Int) -> [String: Any] {
+    var block: [String: Any] = ["file": "camera.mp4", "firstPTS": firstPTS,
+                                "encode": ["w": camWidth, "h": camHeight, "bitrate": camBitrate]]
+    if proxyWritten > 0 {
+        block["proxy"] = ["file": "camera.proxy.mp4", "w": PROXY_W, "h": PROXY_H, "bitrate": PROXY_BITRATE]
+    }
+    return block
+}
+
 func capabilityReport() {
     print("roll-capture \(VERSION)")
     if #available(macOS 13.0, *) { print("ScreenCaptureKit: available") }
@@ -86,6 +102,50 @@ func micDevices() -> [AVCaptureDevice] {
 }
 
 func cmt(_ seconds: Double) -> CMTime { CMTime(seconds: seconds, preferredTimescale: 1_000_000) }
+
+// One H.264 writer+input pair. Each camera runs two — the full-res master and the
+// 480p pack proxy (#13) — fed the same sample buffers, so their PTS are identical
+// and the proxy needs no re-timing downstream. AVAssetWriterInput scales incoming
+// frames to the requested dimensions itself.
+final class CamWriter {
+    private let writer: AVAssetWriter
+    private let input: AVAssetWriterInput
+    private(set) var written = 0
+    private(set) var firstWrittenPTS = 0.0
+
+    init(outURL: URL, w: Int, h: Int, bitrate: Int, fps: Int? = nil) throws {
+        writer = try AVAssetWriter(url: outURL, fileType: .mp4)
+        var compression: [String: Any] = [
+            AVVideoAverageBitRateKey: bitrate,
+            AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+        ]
+        if let fps = fps {
+            compression[AVVideoMaxKeyFrameIntervalKey] = fps * 2
+            compression[AVVideoExpectedSourceFrameRateKey] = fps
+        }
+        input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: w, AVVideoHeightKey: h,
+            AVVideoCompressionPropertiesKey: compression,
+        ])
+        input.expectsMediaDataInRealTime = true
+        writer.add(input)
+        writer.startWriting()
+    }
+
+    func startSession(at t0: Double) { writer.startSession(atSourceTime: cmt(t0)) }
+
+    func append(_ sb: CMSampleBuffer, pts: Double) {
+        guard input.isReadyForMoreMediaData else { return }
+        input.append(sb); written += 1
+        if firstWrittenPTS == 0 { firstWrittenPTS = pts }
+    }
+
+    func finish() async {
+        input.markAsFinished()
+        await writer.finishWriting()
+    }
+}
 
 // ---- screen (ScreenCaptureKit) ----
 // ScreenCaptureKit is change-driven: a static screen emits almost no frames, so
@@ -268,12 +328,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
 // ---- camera (AVFoundation) ----
 final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
-    private var writer: AVAssetWriter!
-    private var input: AVAssetWriterInput!
+    private var master: CamWriter!
+    private var proxy: CamWriter?
     private var writeFrom: Double = .infinity
     private(set) var ready = false
-    private(set) var written = 0
-    private(set) var firstWrittenPTS: Double = 0
+    var written: Int { master?.written ?? 0 }
+    var firstWrittenPTS: Double { master?.firstWrittenPTS ?? 0 }
+    var proxyWritten: Int { proxy?.written ?? 0 }
     private weak var device: AVCaptureDevice?
     private var observers: [NSObjectProtocol] = []
     private var loggedFirstFrame = false
@@ -324,30 +385,23 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         let af = device.activeFormat
         err("📷 armed: device=\(device.localizedName) suspended=\(device.isSuspended) activeFormat=\(af.formatDescription.dimensions.width)x\(af.formatDescription.dimensions.height) centerStageEnabled=\(AVCaptureDevice.isCenterStageEnabled) activeFormatSupportsCenterStage=\(af.isCenterStageSupported)")
 
-        writer = try AVAssetWriter(url: outURL, fileType: .mp4)
-        input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: camWidth, AVVideoHeightKey: camHeight,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: camBitrate,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-            ],
-        ])
-        input.expectsMediaDataInRealTime = true
-        writer.add(input)
-        writer.startWriting()
+        master = try CamWriter(outURL: outURL, w: camWidth, h: camHeight, bitrate: camBitrate)
+        let proxyURL = outURL.deletingLastPathComponent().appendingPathComponent("camera.proxy.mp4")
+        do { proxy = try CamWriter(outURL: proxyURL, w: PROXY_W, h: PROXY_H, bitrate: PROXY_BITRATE) }
+        catch { err("camera proxy writer failed (take continues without it): \(error)") }
         session.startRunning()   // triggers the Continuity Camera handshake NOW
     }
 
     func beginWriting(at t0: Double) {
-        writer.startSession(atSourceTime: cmt(t0))
+        master.startSession(at: t0)
+        proxy?.startSession(at: t0)
         writeFrom = t0
     }
 
     func stop() async {
         session.stopRunning()
-        input.markAsFinished()
-        await writer.finishWriting()
+        await master.finish()
+        await proxy?.finish()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
     }
@@ -362,10 +416,8 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         guard pts.seconds >= writeFrom else { return }
-        if input.isReadyForMoreMediaData {
-            input.append(sampleBuffer); written += 1
-            if firstWrittenPTS == 0 { firstWrittenPTS = pts.seconds }
-        }
+        master.append(sampleBuffer, pts: pts.seconds)
+        proxy?.append(sampleBuffer, pts: pts.seconds)
     }
 }
 
@@ -880,8 +932,7 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
                 "metadata": telemetry.ok ? "metadata.jsonl" : NSNull(),
             ]
             if let c = cam {
-                manifest["camera"] = ["file": "camera.mp4", "firstPTS": c.firstWrittenPTS,
-                                      "encode": ["w": camWidth, "h": camHeight, "bitrate": camBitrate]]
+                manifest["camera"] = cameraManifestBlock(firstPTS: c.firstWrittenPTS, proxyWritten: c.proxyWritten)
                 manifest["cameraSyncOffsetMs"] = (c.firstWrittenPTS - screen.firstWrittenPTS) * 1000
             }
             if let m = mic {
@@ -960,12 +1011,13 @@ final class CameraStation: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private let previewWidth = 480.0
 
     // recording tap (set between beginRecording/finishRecording)
-    private var writer: AVAssetWriter?
-    private var winput: AVAssetWriterInput?
+    private var master: CamWriter?
+    private var proxy: CamWriter?
     private var recFrom = Double.infinity
     private(set) var ready = false
-    private(set) var written = 0
-    private(set) var firstWrittenPTS = 0.0
+    var written: Int { master?.written ?? 0 }
+    var firstWrittenPTS: Double { master?.firstWrittenPTS ?? 0 }
+    var proxyWritten: Int { proxy?.written ?? 0 }
 
     override init() {
         super.init()
@@ -999,32 +1051,23 @@ final class CameraStation: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     // Begin tapping the live session into a file at the shared t0.
     func beginRecording(outURL: URL, at t0: Double, fps: Int) throws {
-        let w = try AVAssetWriter(url: outURL, fileType: .mp4)
-        let inp = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: camWidth, AVVideoHeightKey: camHeight,
-            AVVideoCompressionPropertiesKey: [
-                // 6 Mbps keeps 1080p clean without the ~9.6 Mbps uncapped bloat
-                // (defaults + rationale live on the knobs at the top of the file)
-                AVVideoAverageBitRateKey: camBitrate,
-                AVVideoMaxKeyFrameIntervalKey: fps * 2,
-                AVVideoExpectedSourceFrameRateKey: fps,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-            ],
-        ])
-        inp.expectsMediaDataInRealTime = true
-        w.add(inp)
-        w.startWriting()
-        w.startSession(atSourceTime: cmt(t0))
-        written = 0; firstWrittenPTS = 0
-        winput = inp; writer = w; recFrom = t0
+        let m = try CamWriter(outURL: outURL, w: camWidth, h: camHeight, bitrate: camBitrate, fps: fps)
+        m.startSession(at: t0)
+        let proxyURL = outURL.deletingLastPathComponent().appendingPathComponent("camera.proxy.mp4")
+        do {
+            let p = try CamWriter(outURL: proxyURL, w: PROXY_W, h: PROXY_H, bitrate: PROXY_BITRATE, fps: fps)
+            p.startSession(at: t0)
+            proxy = p
+        } catch { err("camera proxy writer failed (take continues without it): \(error)"); proxy = nil }
+        master = m; recFrom = t0
     }
 
     func finishRecording() async {
         recFrom = .infinity
-        winput?.markAsFinished()
-        await writer?.finishWriting()
-        writer = nil; winput = nil
+        await master?.finish()
+        await proxy?.finish()
+        // keep the refs — written/firstWrittenPTS still feed the manifest after close;
+        // the next beginRecording replaces them
     }
 
     private func emitPreview(_ pb: CVPixelBuffer) {
@@ -1040,9 +1083,9 @@ final class CameraStation: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
         ready = true
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-        if let inp = winput, pts >= recFrom, inp.isReadyForMoreMediaData {
-            inp.append(sampleBuffer); written += 1
-            if firstWrittenPTS == 0 { firstWrittenPTS = pts }
+        if pts >= recFrom {
+            master?.append(sampleBuffer, pts: pts)
+            proxy?.append(sampleBuffer, pts: pts)
         }
         let now = CACurrentMediaTime()
         if now - lastPreview >= previewInterval, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
@@ -1237,8 +1280,7 @@ final class Daemon {
             "metadata": (telemetry?.ok ?? false) ? "metadata.jsonl" : NSNull(),
         ]
         if station.written > 0 {
-            manifest["camera"] = ["file": "camera.mp4", "firstPTS": station.firstWrittenPTS,
-                                  "encode": ["w": camWidth, "h": camHeight, "bitrate": camBitrate]]
+            manifest["camera"] = cameraManifestBlock(firstPTS: station.firstWrittenPTS, proxyWritten: station.proxyWritten)
             manifest["cameraSyncOffsetMs"] = (station.firstWrittenPTS - scr.firstWrittenPTS) * 1000
         }
         if let m = mic, m.written > 0 {
