@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/StuMason/roll/schemas/pack.schema.json",
   "title": "Roll pack",
-  "description": "A recorded take: per-source media + input/semantic telemetry + a manifest, all on one shared host clock (CACurrentMediaTime). This is the contract between the recorder (roll) and everything downstream (crunch, edator). Reflects what capture-swift actually writes as of v0.0.15. COORDINATES: every x/y and ax.bounds in metadata.jsonl is in screen.mp4 PIXEL space — display-local, top-left origin, already scaled for Retina (no global-offset or points→pixels conversion needed downstream). screen.mp4 is constant-frame-rate at manifest.fps with monotonic PTS. A pack may also contain a keyframes/ dir of pristine full-res PNGs named <t_ms>.png (snapshotted on click / app-switch for clean OCR).",
+  "description": "A recorded take: per-source media + input/semantic telemetry + a manifest, all on one shared host clock (CACurrentMediaTime). This is the contract between the recorder (roll) and everything downstream (crunch, edator). Reflects what capture-swift actually writes as of v0.0.16. COORDINATES: every x/y and ax.bounds in metadata.jsonl is in screen.mp4 PIXEL space — display-local, top-left origin, already scaled for Retina (no global-offset or points→pixels conversion needed downstream). screen.mp4 is constant-frame-rate at manifest.fps with monotonic PTS. A pack may also contain a keyframes/ dir of pristine full-res PNGs named <t_ms>.png (snapshotted on click / app-switch for clean OCR).",
   "type": "object",
   "$defs": {
     "sourceRef": {
@@ -25,6 +25,17 @@
           "type": "object",
           "required": ["w", "h", "bitrate"],
           "properties": {
+            "w": { "type": "integer" },
+            "h": { "type": "integer" },
+            "bitrate": { "type": "integer", "description": "H.264 average bitrate in bits/s" }
+          }
+        },
+        "proxy": {
+          "type": "object",
+          "description": "camera.proxy.mp4 — a small analysis copy written live alongside the master (same clock, same PTS, no re-timing; cameraSyncOffsetMs applies to it unchanged). The /pack upload ships this instead of the full-res master to stay under the 100MB edge cap; analysis (face/presence) should run on it. Omitted if the proxy writer failed.",
+          "required": ["file", "w", "h", "bitrate"],
+          "properties": {
+            "file": { "const": "camera.proxy.mp4" },
             "w": { "type": "integer" },
             "h": { "type": "integer" },
             "bitrate": { "type": "integer", "description": "H.264 average bitrate in bits/s" }
