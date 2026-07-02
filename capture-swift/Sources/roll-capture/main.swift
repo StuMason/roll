@@ -20,7 +20,7 @@ import Carbon.HIToolbox   // IsSecureEventInputEnabled (skip capture in password
 // Tauri app can stop it gracefully — a clean finish(), not a SIGKILL that would
 // truncate the mp4). Emits `progress …` lines every 0.5s for the live UI.
 
-let VERSION = "0.0.14"
+let VERSION = "0.0.15"
 
 // keyCodes that have no sensible printable character — named so the key stream
 // is legible (charactersIgnoringModifiers returns control/unicode junk for these)
@@ -55,6 +55,15 @@ func argVal(_ name: String) -> String? {
 }
 func err(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 let args = CommandLine.arguments
+
+// Camera encode knobs (#12). Defaults are the committed decision: 1080p @ 6 Mbps —
+// 720p was fine for the 16:9 PiP but too soft once the shorts pipeline face-crops
+// into the frame for 9:16. Width is derived 16:9; the capture preset snaps to the
+// nearest supported tier so a 720 request captures 720, not downscaled 1080.
+let camHeight = Int(argVal("--cam-height") ?? "") ?? 1080
+let camWidth = camHeight * 16 / 9
+let camBitrate = Int(argVal("--cam-bitrate") ?? "") ?? 6_000_000
+let camPreset: AVCaptureSession.Preset = camHeight <= 720 ? .hd1280x720 : .hd1920x1080
 
 func capabilityReport() {
     print("roll-capture \(VERSION)")
@@ -304,7 +313,7 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         noteCameraEffects(device)   // respect the user's Center Stage setting
         installObservers(device)
         session.beginConfiguration()
-        session.sessionPreset = .hd1280x720
+        session.sessionPreset = camPreset
         let camIn = try AVCaptureDeviceInput(device: device)
         if session.canAddInput(camIn) { session.addInput(camIn) }
         let out = AVCaptureVideoDataOutput()
@@ -318,9 +327,9 @@ final class CameraRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         writer = try AVAssetWriter(url: outURL, fileType: .mp4)
         input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: 1280, AVVideoHeightKey: 720,
+            AVVideoWidthKey: camWidth, AVVideoHeightKey: camHeight,
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 2_500_000,
+                AVVideoAverageBitRateKey: camBitrate,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
             ],
         ])
@@ -871,7 +880,8 @@ func record(screenIdx: Int, camIdx: Int?, micIdx: Int?, outDir: String, fps: Int
                 "metadata": telemetry.ok ? "metadata.jsonl" : NSNull(),
             ]
             if let c = cam {
-                manifest["camera"] = ["file": "camera.mp4", "firstPTS": c.firstWrittenPTS]
+                manifest["camera"] = ["file": "camera.mp4", "firstPTS": c.firstWrittenPTS,
+                                      "encode": ["w": camWidth, "h": camHeight, "bitrate": camBitrate]]
                 manifest["cameraSyncOffsetMs"] = (c.firstWrittenPTS - screen.firstWrittenPTS) * 1000
             }
             if let m = mic {
@@ -968,7 +978,7 @@ final class CameraStation: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     func open(_ dev: AVCaptureDevice) {
         noteCameraEffects(dev)
         session.beginConfiguration()
-        session.sessionPreset = .hd1280x720
+        session.sessionPreset = camPreset
         if let ci = currentInput { session.removeInput(ci); currentInput = nil }
         if let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) {
             session.addInput(input); currentInput = input
@@ -992,11 +1002,11 @@ final class CameraStation: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let w = try AVAssetWriter(url: outURL, fileType: .mp4)
         let inp = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: 1280, AVVideoHeightKey: 720,
+            AVVideoWidthKey: camWidth, AVVideoHeightKey: camHeight,
             AVVideoCompressionPropertiesKey: [
-                // a 720p talking head is visually identical at ~2.5 Mbps; the old
-                // uncapped default ran ~9.6 Mbps (≈720 MB / 10 min). 4× smaller.
-                AVVideoAverageBitRateKey: 2_500_000,
+                // 6 Mbps keeps 1080p clean without the ~9.6 Mbps uncapped bloat
+                // (defaults + rationale live on the knobs at the top of the file)
+                AVVideoAverageBitRateKey: camBitrate,
                 AVVideoMaxKeyFrameIntervalKey: fps * 2,
                 AVVideoExpectedSourceFrameRateKey: fps,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
@@ -1227,7 +1237,8 @@ final class Daemon {
             "metadata": (telemetry?.ok ?? false) ? "metadata.jsonl" : NSNull(),
         ]
         if station.written > 0 {
-            manifest["camera"] = ["file": "camera.mp4", "firstPTS": station.firstWrittenPTS]
+            manifest["camera"] = ["file": "camera.mp4", "firstPTS": station.firstWrittenPTS,
+                                  "encode": ["w": camWidth, "h": camHeight, "bitrate": camBitrate]]
             manifest["cameraSyncOffsetMs"] = (station.firstWrittenPTS - scr.firstWrittenPTS) * 1000
         }
         if let m = mic, m.written > 0 {
@@ -1283,6 +1294,9 @@ if args.contains("--help") || args.contains("-h") {
       --serve                              persistent daemon: one camera session for
                                            live preview (FRAME lines on stdout) + recording
                                            (stdin: cam/rec/stop/quit)
+      --cam-height <720|1080> --cam-bitrate <bps>
+                                           camera encode (default 1080 @ 6000000);
+                                           applies to --screen and --serve
     stop: --secs deadline, SIGINT, or a line / EOF on stdin
     """)
     exit(0)
