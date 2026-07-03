@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { mediaSrc, readPack, reveal } from "../api";
-import type { Pack, PackDetail, TEvent } from "../types";
+import CrunchControl from "./CrunchControl";
+import type { CrunchEvent, Pack, PackDetail, TEvent } from "../types";
 
 // one place for the event vocabulary — colour + short glyph, shared by the
 // timeline ticks and the "now" readout so they always agree
@@ -35,7 +36,7 @@ function describe(e: TEvent): string {
   }
 }
 
-export default function PackInspector({ pack, onClose }: { pack: Pack; onClose: () => void }) {
+export default function PackInspector({ pack, crunch, onClose }: { pack: Pack; crunch?: CrunchEvent; onClose: () => void }) {
   const [detail, setDetail] = useState<PackDetail | null>(null);
   const [src, setSrc] = useState<{ screen: string; camera: string; mic: string; sysaudio: string }>({ screen: "", camera: "", mic: "", sysaudio: "" });
   const [playing, setPlaying] = useState(false);
@@ -160,6 +161,7 @@ export default function PackInspector({ pack, onClose }: { pack: Pack; onClose: 
               cam {pack.cameraSyncOffsetMs > 0 ? "+" : ""}{Math.round(pack.cameraSyncOffsetMs)}ms
             </span>
           )}
+          <CrunchControl pack={pack} ev={crunch} />
           <button className="ghost sm" onClick={() => reveal(pack.dir)}>Reveal</button>
         </div>
       </header>

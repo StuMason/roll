@@ -3,7 +3,7 @@
 // browser (vite dev, no Tauri) they fall back to a believable mock so the whole
 // UI — including a simulated take — can be built and eyeballed without a Mac.
 
-import type { Devices, Pack, PackDetail, RecordConfig, StateEvent } from "./types";
+import type { CrunchEvent, Devices, Pack, PackDetail, RecordConfig, StateEvent } from "./types";
 
 const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -22,6 +22,7 @@ type Listener<T> = (payload: T) => void;
 const stateListeners = new Set<Listener<StateEvent>>();
 const logListeners = new Set<Listener<string>>();
 const savedListeners = new Set<Listener<Pack>>();
+const crunchListeners = new Set<Listener<CrunchEvent>>();
 
 const MOCK_DEVICES: Devices = {
   displays: [
@@ -115,6 +116,29 @@ function mockEndTake(cfg: RecordConfig): void {
     savedListeners.forEach((l) => l(pack));
     emitState({ state: "idle", stats: { elapsedMs: 0 } });
   }, 400);
+}
+
+// A believable crunch run for browser dev: the full stage sequence with a
+// ticking ocr progress bar, ~8s end to end.
+function mockCrunch(pack: Pack) {
+  const ev = (e: Partial<CrunchEvent>) =>
+    crunchListeners.forEach((l) => l({ take: pack.id, dir: pack.dir, status: "processing", ...e } as CrunchEvent));
+  const total = 242;
+  let done = 0;
+  ev({ status: "taring" });
+  setTimeout(() => ev({ status: "uploading" }), 500);
+  setTimeout(() => ev({ status: "queued", jobId: "mock1234" }), 1200);
+  setTimeout(() => ev({ stage: "unpack", jobId: "mock1234" }), 2000);
+  setTimeout(() => ev({ stage: "extract_frames", jobId: "mock1234" }), 2800);
+  const ocr = setInterval(() => {
+    done = Math.min(total, done + 34);
+    ev({ stage: "ocr", done, total, jobId: "mock1234" });
+    if (done >= total) clearInterval(ocr);
+  }, 450);
+  setTimeout(() => ev({ stage: "transcribe", jobId: "mock1234" }), 6600);
+  setTimeout(() => ev({ stage: "analyze", jobId: "mock1234" }), 7300);
+  setTimeout(() => ev({ stage: "assemble", jobId: "mock1234" }), 7800);
+  setTimeout(() => ev({ status: "completed", jobId: "mock1234" }), 8200);
 }
 
 // ---------------------------------------------------------------- public api
@@ -245,5 +269,24 @@ export async function onSaved(cb: Listener<Pack>): Promise<() => void> {
   }
   const { event } = await tauri();
   const un = await event.listen<Pack>("roll://saved", (e) => cb(e.payload));
+  return un;
+}
+
+// Kick off a crunch run for a pack (tar → upload → poll → crunch.json).
+// Fire-and-forget: progress arrives via onCrunch.
+export async function crunchPack(pack: Pack): Promise<void> {
+  if (!isTauri) return void mockCrunch(pack);
+  const { core } = await tauri();
+  await core.invoke("crunch_pack", { dir: pack.dir });
+}
+
+// Live crunch status (one event per stage change / poll tick).
+export async function onCrunch(cb: Listener<CrunchEvent>): Promise<() => void> {
+  if (!isTauri) {
+    crunchListeners.add(cb);
+    return () => crunchListeners.delete(cb);
+  }
+  const { event } = await tauri();
+  const un = await event.listen<CrunchEvent>("roll://crunch", (e) => cb(e.payload));
   return un;
 }

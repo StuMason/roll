@@ -15,6 +15,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+mod crunch;
+
 #[derive(Serialize, Default)]
 struct Device {
     index: u32,
@@ -82,6 +84,8 @@ struct Pack {
     camera_sync_offset_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mic_sync_offset_ms: Option<f64>,
+    /// crunch.json sits next to the media (see crunch.rs)
+    crunched: bool,
 }
 
 /// The persistent `roll-capture --serve` process. It owns the camera the whole
@@ -429,6 +433,7 @@ fn build_pack(dir: &Path, id: &str, duration_ms: u64) -> Pack {
         rows,
         camera_sync_offset_ms,
         mic_sync_offset_ms,
+        crunched: dir.join("crunch.json").exists(),
     }
 }
 
@@ -708,8 +713,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState(Mutex::new(RecorderState::default())))
+        .manage(crunch::Inflight::default())
         .setup(|app| {
             build_tray(app.handle())?;
+            // resume polling any crunch job the last session left in flight
+            let root = recordings_root(app.handle());
+            crunch::resume_jobs(app.handle(), &root);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -722,7 +731,8 @@ pub fn run() {
             stop_recording,
             reveal,
             highlight_display,
-            screen_shot
+            screen_shot,
+            crunch::crunch_pack
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
