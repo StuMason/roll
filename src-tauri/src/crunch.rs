@@ -284,12 +284,19 @@ fn upload_entries(dir: &Path) -> Result<(Vec<String>, u64), String> {
     for e in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Ok(meta) = e.metadata() else { continue };
-        if name.starts_with('.') || name == "camera.mp4" || name == "crunch.json" || name == "crunch.job" {
+        if name.starts_with('.')
+            || name == "camera.mp4"
+            || name == "crunch.json"
+            || name == "crunch.job"
+        {
             continue;
         }
         if meta.is_dir() {
             if name == "keyframes" {
-                for k in std::fs::read_dir(e.path()).map_err(|e| e.to_string())?.flatten() {
+                for k in std::fs::read_dir(e.path())
+                    .map_err(|e| e.to_string())?
+                    .flatten()
+                {
                     if let Ok(m) = k.metadata() {
                         if m.is_file() {
                             total += m.len();
@@ -472,7 +479,11 @@ async fn poll(
                 app,
                 take,
                 dir,
-                if other == "queued" { "queued" } else { "processing" },
+                if other == "queued" {
+                    "queued"
+                } else {
+                    "processing"
+                },
                 CrunchPatch {
                     stage,
                     done: v["progress"]["done"].as_u64(),
@@ -513,14 +524,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("crunch-test-{}", std::process::id()));
         let kf = dir.join("keyframes");
         std::fs::create_dir_all(&kf).unwrap();
-        for f in ["manifest.json", "camera.mp4", "camera.proxy.mp4", "screen.mp4", "crunch.json", "crunch.job", ".DS_Store"] {
+        for f in [
+            "manifest.json",
+            "camera.mp4",
+            "camera.proxy.mp4",
+            "screen.mp4",
+            "crunch.json",
+            "crunch.job",
+            ".DS_Store",
+        ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
         std::fs::write(kf.join("100.png"), [0u8; 10]).unwrap();
         let (names, total) = upload_entries(&dir).unwrap();
         assert_eq!(
             names,
-            vec!["camera.proxy.mp4", "keyframes", "manifest.json", "screen.mp4"]
+            vec![
+                "camera.proxy.mp4",
+                "keyframes",
+                "manifest.json",
+                "screen.mp4"
+            ]
         );
         assert_eq!(total, 3 + 10); // three 1-byte files + the keyframe
         std::fs::remove_dir_all(&dir).unwrap();
@@ -536,10 +560,17 @@ mod tests {
         let names = vec!["keyframes".to_string(), "manifest.json".to_string()];
         let len = make_tar(&dir, &tar, &names).unwrap();
         assert!(len > 0);
-        let out = std::process::Command::new("tar").arg("-tf").arg(&tar).output().unwrap();
+        let out = std::process::Command::new("tar")
+            .arg("-tf")
+            .arg(&tar)
+            .output()
+            .unwrap();
         let listing = String::from_utf8_lossy(&out.stdout);
         for line in listing.lines() {
-            assert!(!line.starts_with('/') && !line.starts_with("./") && !line.contains(".."), "bad entry: {line}");
+            assert!(
+                !line.starts_with('/') && !line.starts_with("./") && !line.contains(".."),
+                "bad entry: {line}"
+            );
             assert!(!line.contains("._"), "AppleDouble leaked: {line}");
         }
         assert!(listing.contains("manifest.json"));
@@ -567,12 +598,17 @@ mod tests {
 
         let (names, total) = upload_entries(&dir).expect("entries");
         assert!(names.contains(&"manifest.json".to_string()));
-        assert!(!names.contains(&"camera.mp4".to_string()), "master must stay local");
+        assert!(
+            !names.contains(&"camera.mp4".to_string()),
+            "master must stay local"
+        );
         eprintln!("tar list: {names:?} ({total} bytes)");
 
         let tar = std::env::temp_dir().join("crunch-e2e.tar");
         let len = make_tar(&dir, &tar, &names).expect("tar");
-        let id = upload(&client, &cfg, &tar, len).await.expect("upload → job id");
+        let id = upload(&client, &cfg, &tar, len)
+            .await
+            .expect("upload → job id");
         let _ = std::fs::remove_file(&tar);
         eprintln!("job {id} accepted (202), polling…");
 
@@ -585,13 +621,19 @@ mod tests {
             match status {
                 "completed" => {
                     let result = v.get("result").cloned().expect("result body");
-                    assert!(result.is_object(), "result should be the crunch.json object");
+                    assert!(
+                        result.is_object(),
+                        "result should be the crunch.json object"
+                    );
                     std::fs::write(
                         dir.join("crunch.json"),
                         serde_json::to_string_pretty(&result).unwrap(),
                     )
                     .expect("write crunch.json");
-                    eprintln!("crunch.json landed ({} top-level keys)", result.as_object().unwrap().len());
+                    eprintln!(
+                        "crunch.json landed ({} top-level keys)",
+                        result.as_object().unwrap().len()
+                    );
                     return;
                 }
                 "failed" => panic!("crunch failed: {} (progress {})", v["error"], v["progress"]),
