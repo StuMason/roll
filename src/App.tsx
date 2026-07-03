@@ -3,8 +3,9 @@ import Dropdown, { Opt } from "./components/Dropdown";
 import CameraPreview from "./components/CameraPreview";
 import MicMeter from "./components/MicMeter";
 import PackInspector from "./components/PackInspector";
-import { ENGINE, highlightDisplay, listDevices, listPacks, onSaved, onState, reveal, screenShot, setPreviewCamera, setPreviewMic, startRecording, stopRecording } from "./api";
-import type { Devices, LiveStats, Pack, RecState, RecordConfig } from "./types";
+import CrunchControl from "./components/CrunchControl";
+import { ENGINE, highlightDisplay, listDevices, listPacks, onCrunch, onSaved, onState, reveal, screenShot, setPreviewCamera, setPreviewMic, startRecording, stopRecording } from "./api";
+import type { CrunchEvent, Devices, LiveStats, Pack, RecState, RecordConfig } from "./types";
 
 const SAVED = "roll.cfg.v1";
 function loadSaved(): Partial<RecordConfig> {
@@ -37,6 +38,8 @@ export default function App() {
   const [showPreview, setShowPreview] = useState(true);
   const [shot, setShot] = useState<string | null>(null);
   const [openPack, setOpenPack] = useState<Pack | null>(null);
+  // latest crunch event per take id — drives the per-pack crunch controls
+  const [crunch, setCrunchEv] = useState<Record<string, CrunchEvent>>({});
 
   const loaded = useRef(false);
   // the daemon finalizes a take almost instantly; hold the "saving" spinner for a
@@ -93,10 +96,17 @@ export default function App() {
         .then((all) => setPacks(all.length ? all : (p) => [pack, ...p]))
         .catch(() => setPacks((p) => [pack, ...p]));
     });
+    // crunch lifecycle: track the latest event per take; when one completes,
+    // re-list from disk so the crunched flag is the on-disk truth
+    const unCrunch = onCrunch((e) => {
+      setCrunchEv((m) => ({ ...m, [e.take]: e }));
+      if (e.status === "completed") listPacks().then(setPacks).catch(() => {});
+    });
     return () => {
       window.removeEventListener("focus", onFocus);
       un.then((f) => f());
       unSaved.then((f) => f());
+      unCrunch.then((f) => f());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -270,6 +280,7 @@ export default function App() {
                       )}
                     </span>
                   </button>
+                  <CrunchControl pack={p} ev={crunch[p.id]} />
                   <button className="ghost sm" onClick={() => reveal(p.dir)}>Reveal</button>
                 </li>
               ))}
@@ -278,7 +289,7 @@ export default function App() {
         </section>
       </div>
 
-      {openPack && <PackInspector pack={openPack} onClose={() => setOpenPack(null)} />}
+      {openPack && <PackInspector pack={openPack} crunch={crunch[openPack.id]} onClose={() => setOpenPack(null)} />}
     </main>
   );
 }

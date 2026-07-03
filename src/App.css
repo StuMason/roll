@@ -304,6 +304,18 @@ body {
 }
 .tag.ok { color: var(--ok); border-color: rgba(68, 214, 160, 0.3); }
 .tag.warn { color: #ffce5c; border-color: rgba(255, 206, 92, 0.3); }
+/* live crunch status — the ocr stage paints a progress fill via inline style */
+.tag.crunching {
+  color: #9db8ff; border-color: rgba(91, 140, 255, 0.35);
+  display: inline-flex; align-items: center; gap: 5px;
+  background-repeat: no-repeat;
+}
+.crunch-spin {
+  width: 8px; height: 8px; border-radius: 50%;
+  border: 1.5px solid rgba(157, 184, 255, 0.35); border-top-color: #9db8ff;
+  animation: crunch-spin 0.9s linear infinite;
+}
+@keyframes crunch-spin { to { transform: rotate(360deg); } }
 
 .packs h2 .count {
   font-family: var(--mono); font-size: 10px; color: var(--muted-2);
