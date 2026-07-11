@@ -12,6 +12,7 @@ The capture-side truths that only the recorder can get are **done** and in the p
 - **#4 clipboard** — `{type:"clipboard", t_ms, chars, text}` (capped 2000, skips concealed/secure payloads).
 - **#5 keyframes** — pristine full-res PNGs in `keyframes/<t_ms>.png`, snapshotted on click / app-switch. **OCR these directly — no H.264 re-decode, no motion blur.**
 - **#7 system-audio** — separate `sysaudio.m4a` track (SCK, same clock; `manifest.sysaudio` + `sysAudioSyncOffsetMs`). Mic stays clean for prosody.
+- **camera proxy (#13)** — `camera.proxy.mp4` (480p @ 600 kbps) written live alongside the 1080p master from the same sample buffers — identical PTS, `cameraSyncOffsetMs` applies unchanged (`manifest.camera.proxy`). The `/pack` upload ships the proxy instead of the master to stay under the 100MB edge cap; crunch analyses the proxy, edator renders from the full-res master.
 
 **Not in roll — this is crunch's job:** #6 camera face/pose signal. Perception over already-captured video belongs in crunch's planned MediaPipe camera track (#16), not the recorder. roll ships raw `camera.mp4`; crunch analyses it. (A capture-time `mouth_open` proxy was tried and pulled — brittle inferred signal, wrong layer.)
 
@@ -27,7 +28,7 @@ flowchart LR
     crunch -->|crunch.json| edator[edator<br/>cut the video]
     subgraph pack[pack contract]
       s[screen.mp4]
-      c[camera.mp4]
+      c[camera.mp4 + camera.proxy.mp4]
       m[mic.m4a]
       meta[metadata.jsonl<br/>click / scroll / key / app_focus]
       man[manifest.json<br/>clocks + sync offsets]

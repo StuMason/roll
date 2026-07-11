@@ -43,6 +43,22 @@ export interface Pack {
   rows?: number; // metadata rows
   cameraSyncOffsetMs?: number;
   micSyncOffsetMs?: number;
+  crunched?: boolean; // crunch.json sits next to the media
+}
+
+// Lifecycle of a one-click crunch run (see src-tauri/src/crunch.rs).
+export type CrunchStatus = "taring" | "uploading" | "queued" | "processing" | "completed" | "failed";
+
+// Payload of the "roll://crunch" event — one per status change / poll tick.
+export interface CrunchEvent {
+  take: string; // pack id
+  dir: string;
+  status: CrunchStatus;
+  stage?: string; // unpack → extract_frames → ocr → transcribe → analyze → assemble
+  done?: number; // ocr progress (the only stage with counts)
+  total?: number;
+  error?: string;
+  jobId?: string;
 }
 
 // Payload of the "roll://state" event the backend emits while a take runs.
