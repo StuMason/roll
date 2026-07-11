@@ -17,7 +17,7 @@ jobs:
       run:
         working-directory: capture-swift
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: swift --version
       - name: Build
         run: swift build -c release
