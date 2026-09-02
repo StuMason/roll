@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+#
+# roll-ship — push a finished roll pack to EdAtor Cloud and watch it get perceived.
+#
+#   roll-ship                          # ship the newest take in ~/Movies/roll
+#   roll-ship ~/Movies/roll/rec-123    # ship a specific pack
+#   roll-ship --title "The confession" # newest take, with a title
+#
+# Auth: a device token cached at ~/.config/roll/edator-token. First run (or after
+# revoking) mint one by setting EDATOR_EMAIL and EDATOR_PASSWORD once:
+#
+#   EDATOR_EMAIL=you@example.com EDATOR_PASSWORD=... roll-ship
+#
+# Config: EDATOR_URL overrides the API base (default https://edator.stumason.dev).
+#
+# Flow (the documented client contract, docs/PACK-API.md in edator-cloud):
+#   POST /api/v1/packs {manifest}  ->  presigned R2 PUT urls (direct upload, no
+#   proxy, no size cap)  ->  PUT each file  ->  POST complete  ->  poll until the
+#   pipeline has perceived the take (transcript + beats + searchable library).
+set -euo pipefail
+
+EDATOR_URL="${EDATOR_URL:-https://edator.stumason.dev}"
+TOKEN_FILE="${HOME}/.config/roll/edator-token"
+
+say()  { printf '\033[1;32m▸\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+
+command -v jq >/dev/null || fail "jq is required (brew install jq)"
+command -v curl >/dev/null || fail "curl is required"
+
+# --- args ---------------------------------------------------------------------
+PACK_DIR=""
+TITLE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title) TITLE="${2:?--title needs a value}"; shift 2 ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) PACK_DIR="$1"; shift ;;
+  esac
+done
+
+if [ -z "$PACK_DIR" ]; then
+  PACK_DIR=$(ls -dt "${HOME}/Movies/roll"/rec-* 2>/dev/null | head -1) \
+    || fail "no packs in ~/Movies/roll — record a take first (or pass a pack dir)"
+fi
+PACK_DIR="${PACK_DIR%/}"
+[ -f "${PACK_DIR}/manifest.json" ] || fail "no manifest.json in ${PACK_DIR} — not a finished pack"
+
+# --- auth ---------------------------------------------------------------------
+if [ ! -s "$TOKEN_FILE" ]; then
+  [ -n "${EDATOR_EMAIL:-}" ] && [ -n "${EDATOR_PASSWORD:-}" ] \
+    || fail "no token at ${TOKEN_FILE} — run once with EDATOR_EMAIL and EDATOR_PASSWORD set"
+  say "minting device token for ${EDATOR_EMAIL}"
+  mkdir -p "$(dirname "$TOKEN_FILE")"
+  curl -fsS -X POST "${EDATOR_URL}/api/v1/device/token" -H 'Accept: application/json' \
+    --data-urlencode "email=${EDATOR_EMAIL}" \
+    --data-urlencode "password=${EDATOR_PASSWORD}" \
+    --data-urlencode "device_name=roll-ship $(hostname -s)" \
+    | jq -er '.token' > "$TOKEN_FILE" || fail "device token request failed"
+  chmod 600 "$TOKEN_FILE"
+fi
+TOKEN=$(cat "$TOKEN_FILE")
+auth=(-H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/json')
+
+# --- 1. create the pack from the manifest --------------------------------------
+say "shipping $(basename "$PACK_DIR") to ${EDATOR_URL}"
+CREATED=$(jq -n --arg title "${TITLE}" --arg cid "$(basename "$PACK_DIR")" \
+    --slurpfile m "${PACK_DIR}/manifest.json" \
+    '{title: (if $title == "" then null else $title end), client_pack_id: $cid, manifest: $m[0]}' \
+  | curl -fsS -X POST "${EDATOR_URL}/api/v1/packs" "${auth[@]}" \
+      -H 'Content-Type: application/json' --data-binary @-) \
+  || fail "pack create rejected (bad manifest?)"
+PACK_ID=$(jq -er '.pack.id' <<<"$CREATED")
+say "pack ${PACK_ID}"
+
+# --- 2. PUT every declared file straight to R2 ---------------------------------
+# NOTE: presigned URLs may sign no Content-Type — never send one that wasn't signed.
+FAILED=0
+while IFS= read -r upload; do
+  role=$(jq -r '.role' <<<"$upload")
+  filename=$(jq -r '.filename' <<<"$upload")
+  url=$(jq -r '.url' <<<"$upload")
+  file="${PACK_DIR}/${filename}"
+
+  if [ ! -f "$file" ]; then
+    printf '  %-14s SKIP (declared in manifest but not on disk)\n' "$role"
+    FAILED=1
+    continue
+  fi
+
+  size=$(du -h "$file" | cut -f1 | tr -d ' ')
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 -X PUT "$url" \
+    --data-binary @"$file" </dev/null) || code=000
+  printf '  %-14s %-8s -> %s\n' "$role" "$size" "$code"
+  [ "$code" = "200" ] || FAILED=1
+done < <(jq -c '.uploads[]' <<<"$CREATED")
+[ "$FAILED" = "0" ] || fail "one or more uploads failed — re-run to retry (same take, new pack)"
+
+# --- 3. complete: server verifies every object, then queues perception ---------
+curl -fsS -X POST "${EDATOR_URL}/api/v1/packs/${PACK_ID}/complete" "${auth[@]}" >/dev/null \
+  || fail "complete rejected — a declared file is missing in R2"
+say "uploaded — perceiving (transcribe, OCR, beats)…"
+
+# --- 4. poll until the pipeline is done ----------------------------------------
+for _ in $(seq 1 180); do
+  sleep 10
+  PACK=$(curl -fsS "${EDATOR_URL}/api/v1/packs/${PACK_ID}" "${auth[@]}") || continue
+  STATUS=$(jq -r '.pack.status' <<<"$PACK")
+  case "$STATUS" in
+    ready)
+      say "ready ✂ $(jq -r '"total \((.pack.timings.total_ms // 0) / 1000 | round)s (asr \((.pack.timings.transcribe_mic_ms // 0) / 1000 | round)s, ocr \((.pack.timings.ocr_ms // 0) / 1000 | round)s)"' <<<"$PACK")"
+      say "searchable: ${EDATOR_URL}/api/v1/search?q=…  (pack ${PACK_ID})"
+      exit 0 ;;
+    failed)
+      fail "perception failed: $(jq -r '.pack.error // "unknown"' <<<"$PACK")" ;;
+    *) printf '  … %s\n' "$STATUS" ;;
+  esac
+done
+fail "timed out waiting for perception (check the pack in the dashboard: ${PACK_ID})"
